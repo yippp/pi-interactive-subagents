@@ -1,7 +1,7 @@
 # Pi-Bolt compatibility port
 
-Status: local working tree only. No remote fork, no push, and the user's
-settings, installed packages, and Herdr configuration were not touched.
+This branch is published in a fork for review. Installing it alongside the
+existing extension, or replacing the user's package, requires separate validation.
 
 Base: upstream `c41d6fc` (`@jordyvanvorselen/pi-interactive-subagents` 1.2.0).
 The port keeps the Herdr TUI (`herdr.ts`) and Herdr desktop / herdr-core
@@ -170,16 +170,12 @@ no per-server isolation for MCP.
 
 ## Switch blockers (unverified, do not replace the active package until checked)
 
-1. No live Herdr TUI or Herdr desktop spawn/resume was run in this task. The
-   workspace already had a running Herdr session and a real model call was out
-   of scope. Unit tests cover the command builders, not surface creation.
-2. The Windows hc/Core fix is covered by unit tests only here. The real
-   herdr-core launch (`hc run` with the absolute Git Bash, a script path with
-   spaces, and a cwd with spaces) must be retested by `core-test-plan` before
-   this branch replaces the active package.
-3. No live Pi-Bolt child was launched in a pane. `resolveChildPiBin` is tested
-   as a pure function; `pi-bolt.exe --session ...` in a Herdr surface remains
-   unconfirmed.
+1. Windows herdr-core 0.1.17 was tested headlessly with the desktop backend:
+   an isolated 65-check probe covered child launch, message delivery, exit
+   status, cleanup, and a real `pi-bolt.exe --version` invocation. The probe
+   did not run a model request or validate the GUI layout.
+2. A full live Herdr TUI or desktop subagent task and resume remain unverified.
+3. The executable probe did not test `pi-bolt.exe --session ...` in a pane.
 4. `getAllTools().sourceInfo` was exercised through a mocked extension API.
    The installed pi-web-access package does register `fetch_content`,
    `get_search_content`, and `source_check`, but a live parent was not queried.
