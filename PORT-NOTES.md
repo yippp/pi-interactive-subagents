@@ -49,6 +49,14 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   from it. The parent's current `ctx.model` is not used. Missing defaults,
   out-of-scope defaults, invalid patterns, and unresolved trust are refused
   instead of snapshotting the wrong provider.
+- Child session placement — child session files are created in the parent's
+  actual session directory (`ctx.sessionManager.getSessionDir()`), not a
+  re-derived default. An explicit `--session-dir` / settings `sessionDir` is
+  authoritative for every child, including a cross-project `cwd`, so lab runs
+  do not leak into `~/.pi/agent/sessions`. With default session dirs, a child
+  in the parent's cwd uses the parent's dir, while an explicit cross-project
+  cwd uses that project's default grouping. The path encoding mirrors pi
+  (`--G--repo--`). Resume and fork follow the stored file path.
 - Tool source mapping — `getToolExtensionPath` now resolves `sourceInfo.path`
   from `getAllTools()` for npm/git/local extensions instead of guessing
   `<agent dir>/extensions/<name>/index.ts`. This is what makes
@@ -123,7 +131,7 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 225 tests, 225 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 229 tests, 229 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
   works if `PI_SUBAGENT_ALLOWED` is unset.
@@ -141,6 +149,11 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   explicit deny/never global fallback, project extensions and unreadable trust
   store fail-closed, out-of-scope enabledModels/missing defaults, provider
   prefix handling, and refusal of null-model snapshots).
+- Child session placement tests cover an explicit lab `--session-dir`
+  (including a cross-project cwd and no default-dir pollution), the parent's
+  actual dir for the same cwd, the child cwd's default grouping for
+  cross-project cwd, Windows drive-colon encoding, and seeding a fork in the
+  lab directory with the child cwd in its header.
 - Windows hc launch tests cover an absolute Git Bash plus a script and cwd
   containing spaces, `resolveBashFor` precedence (configured shell, Program
   Files Git, msys64, never a bare PATH bash), rejection of a non-absolute
@@ -196,13 +209,17 @@ no per-server isolation for MCP.
    requests in Herdr surfaces.
 9. The Windows cwd fix is covered by a unit test on win32, not by a live spawn
    with a drive-letter cwd.
-10. Only `antigravity-acp` and the upstream Anthropic auth extension have
+10. Child session placement is covered by unit tests only. The real
+    `--session-dir` + Pi-Bolt E2E should be rerun after this fix to confirm no
+    session file appears under `~/.pi/agent/sessions` and that resume/fork
+    still work.
+11. Only `antigravity-acp` and the upstream Anthropic auth extension have
     provider mappings. Other extension-provided providers need an entry or
     `registerProviderExtension`.
-11. The fork/lineage summary baseline is tested at the `summarizeAttempt`
+12. The fork/lineage summary baseline is tested at the `summarizeAttempt`
     level, not by spawning a real seeded fork session. Verify with a live fork
     run before relying on the last-message summary.
-12. Omitted-model resolution follows pi's trust order but cannot run project
+13. Omitted-model resolution follows pi's trust order but cannot run project
     extension `project_trust` handlers: a project `.pi/extensions` directory
     fails closed. With no project settings file no trust gate is applied. When
     one exists, explicit trust-store decisions win; `always`/`never` are

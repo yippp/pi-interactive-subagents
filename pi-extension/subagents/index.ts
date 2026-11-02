@@ -514,13 +514,44 @@ function resolveSubagentPaths(
   return { effectiveCwd, localAgentDir, effectiveAgentDir };
 }
 
-function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
+function defaultSessionDirPath(cwd: string, agentDir: string): string {
+  // Mirrors pi's getDefaultSessionDirPath, including the Windows drive-colon
+  // encoding (`G:\repo` -> `--G--repo--`). Pure: callers choose whether to
+  // create the directory, so an explicit --session-dir is never polluted with
+  // an unused default directory.
   const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-  const sessionDir = join(agentDir, "sessions", safePath);
-  if (!existsSync(sessionDir)) {
-    mkdirSync(sessionDir, { recursive: true });
-  }
-  return sessionDir;
+  return join(agentDir, "sessions", safePath);
+}
+
+function samePath(a: string, b: string): boolean {
+  const left = canonicalizePath(a);
+  const right = canonicalizePath(b);
+  return process.platform === "win32"
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
+/**
+ * Choose where a child session file lives.
+ *
+ * - An explicit session dir (`--session-dir`, settings `sessionDir`, or a
+ *   session file opened from a custom directory) is authoritative: children go
+ *   beside the parent, even when the child runs in another project. This keeps
+ *   lab runs out of the user's default `~/.pi/agent/sessions` tree.
+ * - With default session dirs and the same cwd, use the parent's actual dir.
+ * - With default session dirs and an explicit cross-project cwd, use that
+ *   project's default grouping so resume-by-cwd still works.
+ */
+function resolveChildSessionDir(opts: {
+  parentSessionDir: string;
+  parentCwd: string;
+  childCwd: string;
+  agentDir: string;
+  usesDefaultSessionDir: boolean;
+}): string {
+  if (!opts.usesDefaultSessionDir) return opts.parentSessionDir;
+  if (samePath(opts.parentCwd, opts.childCwd)) return opts.parentSessionDir;
+  return defaultSessionDirPath(opts.childCwd, opts.agentDir);
 }
 
 function resolveEffectiveSessionMode(
@@ -1745,6 +1776,8 @@ export const __test__ = {
   resolveSubagentPaths,
   resolveChildPiBin,
   resolveChildInitialModel,
+  resolveChildSessionDir,
+  defaultSessionDirPath,
   lastModelInSession,
   watchSubagentWithRetry,
   summarizeAttempt,
@@ -1772,6 +1805,8 @@ async function launchSubagent(
       getSessionFile(): string | null | undefined;
       getSessionId(): string;
       getSessionDir(): string;
+      /** Present on pi's SessionManager; used to detect --session-dir. */
+      usesDefaultSessionDir?(): boolean;
     };
     cwd: string;
   },
@@ -1800,7 +1835,19 @@ async function launchSubagent(
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
-  const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
+  const parentSessionDir = ctx.sessionManager.getSessionDir();
+  const usesDefaultSessionDir =
+    typeof ctx.sessionManager.usesDefaultSessionDir === "function"
+      ? ctx.sessionManager.usesDefaultSessionDir()
+      : samePath(parentSessionDir, defaultSessionDirPath(ctx.cwd, effectiveAgentDir));
+  const sessionDir = resolveChildSessionDir({
+    parentSessionDir,
+    parentCwd: ctx.cwd,
+    childCwd: targetCwdForSession,
+    agentDir: effectiveAgentDir,
+    usesDefaultSessionDir,
+  });
+  mkdirSync(sessionDir, { recursive: true });
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
   // Resolve the real child model before any surface exists. An omitted model
   // means the child reads its own settings, not the parent's current ctx.model.

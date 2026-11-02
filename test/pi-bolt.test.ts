@@ -1,13 +1,14 @@
 import { it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, basename, join, resolve, sep } from "node:path";
 import extension, { __test__ as api } from "../pi-extension/subagents/index.ts";
 import { shellEscape } from "../pi-extension/subagents/herdr.ts";
 import {
   loadoutSidecarPath,
   readSubagentLoadout,
+  seedSubagentSessionFile,
   writeSubagentLoadout,
   type SubagentLoadout,
 } from "../pi-extension/subagents/session.ts";
@@ -407,5 +408,104 @@ it("subagent_wait releases on a real child question, and a timeout leaves childr
     const timeout = await wait.execute("t", { names: ["a"], timeoutMs: 0 }, undefined);
     assert.equal(timeout.details.reason, "timeout");
     assert.equal(api.joins.snapshot()[0].status, "running");
+  });
+});
+
+// ── child session directory ──────────────────────────────────────────────────
+
+it("puts child sessions in an explicit parent session dir (--session-dir lab)", async () => {
+  await withTempDir("pi-session-lab-", (dir) => {
+    const agentDir = join(dir, "agent");
+    const lab = join(dir, "lab sessions");
+    const childCwd = join(dir, "other project");
+    const chosen = api.resolveChildSessionDir({
+      parentSessionDir: lab,
+      parentCwd: join(dir, "parent project"),
+      childCwd,
+      agentDir,
+      usesDefaultSessionDir: false,
+    });
+    assert.equal(chosen, lab, "an explicit --session-dir is authoritative");
+    assert.equal(
+      existsSync(api.defaultSessionDirPath(childCwd, agentDir)),
+      false,
+      "no default session dir is derived or created for the child",
+    );
+    assert.ok(!chosen.startsWith(join(agentDir, "sessions")), "must not fall back to the user's default tree");
+  });
+});
+
+it("uses the parent's actual dir for the same cwd and the child cwd's default for a cross-project cwd", async () => {
+  await withTempDir("pi-session-default-", (dir) => {
+    const agentDir = join(dir, "agent");
+    const parentCwd = join(dir, "project");
+    const parentDir = api.defaultSessionDirPath(parentCwd, agentDir);
+    assert.equal(
+      api.resolveChildSessionDir({
+        parentSessionDir: parentDir,
+        parentCwd,
+        childCwd: parentCwd,
+        agentDir,
+        usesDefaultSessionDir: true,
+      }),
+      parentDir,
+    );
+    const childCwd = join(dir, "other");
+    assert.equal(
+      api.resolveChildSessionDir({
+        parentSessionDir: parentDir,
+        parentCwd,
+        childCwd,
+        agentDir,
+        usesDefaultSessionDir: true,
+      }),
+      api.defaultSessionDirPath(childCwd, agentDir),
+      "explicit cross-project cwd keeps that project's grouping",
+    );
+  });
+});
+
+it("encodes Windows drive and path dialects without polluting the default tree", () => {
+  const encoded = api.defaultSessionDirPath("G:\\repo\\sub dir", "C:\\agent dir");
+  assert.equal(basename(encoded), "--G--repo-sub dir--");
+  assert.equal(dirname(encoded), join("C:\\agent dir", "sessions"));
+});
+
+it("seeds a fork in an explicit lab dir with the child cwd in its header", async () => {
+  await withTempDir("pi-session-fork-", (dir) => {
+    const parent = join(dir, "parent.jsonl");
+    writeFileSync(
+      parent,
+      [
+        JSON.stringify({ type: "session", id: "parent", version: 3, cwd: dir }),
+        JSON.stringify({ type: "model_change", provider: "magpie", modelId: "group/master" }),
+        JSON.stringify({ type: "message", message: { role: "user", content: [] } }),
+      ].join("\n") + "\n",
+    );
+    const agentDir = join(dir, "agent");
+    const lab = join(dir, "lab");
+    const childCwd = join(dir, "child project");
+    mkdirSync(childCwd, { recursive: true });
+    const sessionDir = api.resolveChildSessionDir({
+      parentSessionDir: lab,
+      parentCwd: dir,
+      childCwd,
+      agentDir,
+      usesDefaultSessionDir: false,
+    });
+    mkdirSync(sessionDir, { recursive: true });
+    const child = join(sessionDir, "child.jsonl");
+    seedSubagentSessionFile({
+      mode: "fork",
+      parentSessionFile: parent,
+      childSessionFile: child,
+      childCwd,
+    });
+    assert.ok(existsSync(child));
+    const lines = readFileSync(child, "utf8").split("\n").filter((line) => line.trim());
+    const header = JSON.parse(lines[0]);
+    assert.equal(header.cwd, childCwd);
+    assert.equal(header.parentSession, parent);
+    assert.ok(lines.some((line) => line.includes('"model_change"')));
   });
 });
