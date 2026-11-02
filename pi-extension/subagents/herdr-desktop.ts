@@ -26,7 +26,7 @@
 import { execFile, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
-import { resolveBash } from "./shell.ts";
+import { resolveBashStrict } from "./shell.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -194,9 +194,9 @@ export function launchArgv(
   const platform = options.platform ?? process.platform;
   if (platform === "win32") {
     // herdr-core starts this argv itself, so a bare `bash` is resolved against
-    // the Windows registry PATH, which often has no Git bin directory. Use the
-    // same absolute Git Bash as the TUI path, never the WSL stub from PATH.
-    return [options.bash?.trim() || resolveBash(platform), scriptPath];
+    // the Windows registry PATH, which often has no Git bin directory. Require
+    // an absolute Git Bash; never fall back to the WSL stub from PATH.
+    return [options.bash?.trim() || resolveBashStrict(platform), scriptPath];
   }
   const shell = options.shell?.trim() || "/bin/sh";
   return [shell, "-l", "-i", "-c", `exec bash ${quote(scriptPath)}`];

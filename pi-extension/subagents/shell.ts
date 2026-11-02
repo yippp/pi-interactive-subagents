@@ -7,7 +7,7 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 
 export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
@@ -16,47 +16,52 @@ export function shellEscape(s: string): string {
 const resolvedBash = new Map<NodeJS.Platform, string>();
 
 /**
- * Resolve the Bash that runs launch scripts, mirroring Pi's own resolution:
- * `shellPath` from settings.json, then Git Bash, then PATH.
- *
- * On Windows a bare `bash` usually resolves to the WSL launcher in
- * `%SystemRoot%\System32`, which re-parses its command line and strips the
- * backslashes out of a Windows script path, so Git Bash has to win. Callers
- * that spawn a terminal outside the pane's shell (`hc run`) need an absolute
- * path: herdr-core resolves a bare command against the registry PATH, which
- * may not contain Git's `bin` directory at all.
+ * Resolve the Bash used by the TUI launch path. Falls back to bare `bash` when
+ * no absolute Windows candidate exists; that fallback keeps the historical TUI
+ * behaviour. The desktop backend must use `resolveBashStrict` instead.
  */
 export function resolveBash(platform: NodeJS.Platform = process.platform): string {
   const cached = resolvedBash.get(platform);
   if (cached) return cached;
 
-  const value = resolveBashFor(
-    platform,
-    process.env,
-    existsSync,
-    readShellPathSetting(process.env),
-  );
+  const value =
+    resolveBashFor(platform, process.env, existsSync, readShellPathSetting(process.env)) ??
+    "bash";
   resolvedBash.set(platform, value);
   return value;
 }
 
 /**
- * Pure resolver, used by tests. Only absolute candidates are considered on
- * Windows; a bare `bash` from PATH may be the WSL stub.
+ * Resolve an absolute Bash for a terminal started by herdr-core (`hc run`).
+ * A bare `bash` is not acceptable there: herdr-core resolves it against the
+ * registry PATH, which may not contain Git's `bin` directory at all, and the
+ * WSL stub in System32 mangles Windows script paths. Throws with a
+ * `PI_SHELL_PATH` hint when no absolute candidate exists.
+ */
+export function resolveBashStrict(platform: NodeJS.Platform = process.platform): string {
+  return requireBash(platform, process.env, existsSync, readShellPathSetting(process.env));
+}
+
+/**
+ * Pure resolver, used by tests. On Windows, returns the first existing
+ * absolute candidate (configured shellPath, Program Files Git, msys64), or
+ * null. Non-Windows keeps `bash` because the launch path runs a login shell.
  */
 export function resolveBashFor(
   platform: NodeJS.Platform,
   env: NodeJS.ProcessEnv,
   exists: (path: string) => boolean,
   configuredShellPath = "",
-): string {
+): string | null {
   if (platform !== "win32") return "bash";
 
   const configured = env.PI_SHELL_PATH?.trim() || configuredShellPath.trim();
   // Build Windows paths regardless of the host running the test/simulation.
   const winJoin = (...parts: string[]) => parts.join("\\");
   const candidates = [
-    configured,
+    // A relative or bare configured value cannot be used by herdr-core and
+    // may be the WSL stub; ignore it instead of silently accepting it.
+    win32.isAbsolute(configured) ? configured : "",
     winJoin(env.ProgramFiles ?? "C:\\Program Files", "Git", "bin", "bash.exe"),
     winJoin(
       env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)",
@@ -67,7 +72,29 @@ export function resolveBashFor(
     "C:\\msys64\\usr\\bin\\bash.exe",
   ].filter((candidate): candidate is string => !!candidate?.trim());
 
-  return candidates.find((candidate) => exists(candidate)) ?? "bash";
+  return candidates.find((candidate) => exists(candidate)) ?? null;
+}
+
+/** Throw the user-facing error for a Windows host with no absolute Bash. */
+export function requireBash(
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+  exists: (path: string) => boolean,
+  configuredShellPath = "",
+): string {
+  const bash = resolveBashFor(platform, env, exists, configuredShellPath);
+  if (bash) return bash;
+  const configured = env.PI_SHELL_PATH?.trim() || configuredShellPath.trim();
+  throw new Error(
+    "Cannot start the Herdr desktop terminal: no absolute bash.exe was found. " +
+      "Set PI_SHELL_PATH (or shellPath in settings.json) to an absolute Git Bash path, " +
+      "for example C:\\Program Files\\Git\\bin\\bash.exe. " +
+      (configured && !win32.isAbsolute(configured)
+        ? `The configured path "${configured}" is not absolute. `
+        : "") +
+      "A bare `bash` from PATH is not used because it may be the WSL stub and " +
+      "herdr-core resolves it against the registry PATH.",
+  );
 }
 
 /** `shellPath` from the global settings, the same knob that configures Pi's own shell. */

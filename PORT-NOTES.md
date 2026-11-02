@@ -37,13 +37,15 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   the result rather than thrown.
 - Provider/auth snapshot — when a profile omits `model:`, the effective child
   model is resolved **before** any surface opens: a fork uses the parent
-  session's last `model_change`; otherwise the child's global/project settings
-  must provide `defaultProvider` + `defaultModel` and must not set
-  `enabledModels`. The resolved model is pinned in the loadout, then
-  `providerExtensions` and `providerAuthExtension` are snapshotted from it.
-  The parent's current `ctx.model` is not used, because the child resolves its
-  own settings. An unresolvable case is refused instead of snapshotting the
-  wrong provider.
+  session's last `model_change`; otherwise the child cwd must have a verified
+  trusted project, settings must provide `defaultProvider` + `defaultModel`,
+  and `enabledModels` (if present) must include that default. A stored
+  `defaultModel` that already starts with the provider is not double-prefixed.
+  The resolved model is pinned in the loadout, then `providerExtensions` and
+  `providerAuthExtension` are snapshotted from it. The parent's current
+  `ctx.model` is not used. Untrusted projects, missing defaults, out-of-scope
+  defaults, and invalid patterns are refused instead of snapshotting the wrong
+  provider.
 - Tool source mapping — `getToolExtensionPath` now resolves `sourceInfo.path`
   from `getAllTools()` for npm/git/local extensions instead of guessing
   `<agent dir>/extensions/<name>/index.ts`. This is what makes
@@ -68,11 +70,14 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 - Windows hc (Core) launch — `herdr-desktop.ts` used a bare `bash`, which
   herdr-core resolves against the Windows registry PATH (often without Git's
   bin directory), so `hc run` failed with `cannot start bash: not found on
-  PATH`. The launch argv now uses the shared `resolveBash()` (extracted to
-  `shell.ts` to avoid a herdr/herdr-desktop cycle): `PI_SHELL_PATH` / settings
-  `shellPath`, Program Files Git, Program Files (x86) Git, then msys64. Only
-  absolute candidates are used, never the WSL stub from PATH. The bash, script,
-  and cwd are passed as separate argv/`--cwd` values, so spaces are preserved
+  PATH`. The launch argv now uses strict resolution in `shell.ts` (extracted to
+  avoid a herdr/herdr-desktop cycle): `PI_SHELL_PATH` / settings `shellPath`
+  (only when absolute), Program Files Git, Program Files (x86) Git, then
+  msys64. A relative/bare configured path is ignored. If no absolute candidate
+  exists, the desktop launch **refuses** with a `PI_SHELL_PATH` hint; it never
+  falls back to a bare `bash` or the WSL stub. The TUI path keeps its
+  historical bare-`bash` fallback via `resolveBash()`. The bash, script, and
+  cwd are passed as separate argv/`--cwd` values, so spaces are preserved
   without shell quoting. Desktop availability now checks `hcBin()`, so
   `PI_SUBAGENT_HC_BIN` is respected.
 - CRLF agent files — `parseAgentDefinition` normalizes CRLF before parsing.
@@ -86,11 +91,15 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 - Profiles without `tools:` are read-only. All bundled agents declare tools;
   a local agent that relies on implicit full access must add `tools:`.
 - Profiles without `model:` are accepted only when the child's effective model
-  can be resolved reliably (fork: a recorded model_change; otherwise child
-  settings with `defaultProvider`/`defaultModel` and no `enabledModels`). The
-  resolved model is pinned for the run. Otherwise spawn is refused with an
-  explicit error; set `model:` in the profile. The parent's `ctx.model` is
-  deliberately ignored.
+  can be resolved reliably. A fork uses its recorded `model_change`; otherwise
+  the child project must have a verified `true` trust decision, settings must
+  provide `defaultProvider` + `defaultModel`, and `enabledModels` (if present)
+  must include that default. The resolved model is pinned for the run, and a
+  stored `defaultModel` that already begins with the provider is not
+  double-prefixed. Otherwise spawn is refused with an explicit error; set
+  `model:` in the profile. The parent's `ctx.model` is deliberately ignored;
+  project settings are never read when trust is absent or false, because they
+  could silently override the global default.
 - Pre-port loadout snapshots without a tool list cannot be resumed. Spawn a
   fresh named agent instead.
 - `subagent_wait` state is in memory. After `/reload` or restart, resume the
@@ -104,7 +113,7 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 216 tests, 216 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 221 tests, 221 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
   works if `PI_SUBAGENT_ALLOWED` is unset.
@@ -117,12 +126,15 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   the same run id, exhaustion, retry-start failure, retry/summary/delivery
   exceptions, missing and corrupt transcripts, seeded-session summary
   baseline, parallel retries, MCP refusal, pinned provider/auth failure,
-  omitted-model resolution from child settings and forks, refusal on
-  enabledModels/missing defaults, and refusal of null-model snapshots).
+  omitted-model resolution from trusted child settings and forks, refusal on
+  untrusted projects/out-of-scope enabledModels/missing defaults, provider
+  prefix handling, and refusal of null-model snapshots).
 - Windows hc launch tests cover an absolute Git Bash plus a script and cwd
   containing spaces, `resolveBashFor` precedence (configured shell, Program
-  Files Git, msys64, never a bare PATH bash), and `isHerdrDesktopAvailable()`
-  honouring an existing/missing `PI_SUBAGENT_HC_BIN` path.
+  Files Git, msys64, never a bare PATH bash), rejection of a non-absolute
+  `shellPath`, the explicit `PI_SHELL_PATH` refusal when no candidate exists,
+  and `isHerdrDesktopAvailable()` honouring an existing/missing
+  `PI_SUBAGENT_HC_BIN` path.
 - Bundled `researcher` and `worker` now request `fetch_content` instead of the
   removed `web_fetch`; with the new hard failure, `web_fetch` made both agents
   impossible to spawn on a clean install. The README agent table was corrected
@@ -182,8 +194,9 @@ no per-server isolation for MCP.
 11. The fork/lineage summary baseline is tested at the `summarizeAttempt`
     level, not by spawning a real seeded fork session. Verify with a live fork
     run before relying on the last-message summary.
-12. Omitted-model resolution reads the child's global/project settings and a
-    fork's recorded `model_change`. It refuses when `enabledModels` scopes the
-    session or defaults are absent. A trust difference between parent and
-    child project settings could still change the effective model; set
-    `model:` explicitly when that matters.
+12. Omitted-model resolution reads the child's trusted project/global settings
+    and a fork's recorded `model_change`. It refuses when project trust is not
+    verified `true`, defaults are absent or patterned, or the default is not in
+    `enabledModels` scope. `enabledModels` matching uses conservative globs; a
+    fuzzy pattern that cannot be proven to include the default is refused even
+    though pi might resolve it. Set `model:` explicitly where that matters.

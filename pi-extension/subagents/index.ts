@@ -13,6 +13,7 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  realpathSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -537,6 +538,66 @@ function readJsonSettings(path: string): any | null {
   }
 }
 
+function canonicalizePath(path: string): string {
+  try {
+    return realpathSync(resolve(path));
+  } catch {
+    return resolve(path);
+  }
+}
+
+/**
+ * Nearest ancestor trust decision for `cwd`, mirroring pi's trust store.
+ * Returns null when no entry exists or the store cannot be read.
+ */
+function projectTrustDecision(agentDir: string, cwd: string): boolean | null {
+  const store = readJsonSettings(join(agentDir, "trust.json"));
+  if (!store || typeof store !== "object" || Array.isArray(store)) return null;
+  let current = canonicalizePath(cwd);
+  for (;;) {
+    const value = (store as Record<string, unknown>)[current];
+    if (value === true || value === false) return value;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+function globToRegExp(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  return new RegExp(`^${escaped}$`);
+}
+
+/** True when the concrete model matches any enabledModels pattern. */
+function modelMatchesScope(model: string, patterns: string[]): boolean {
+  return patterns.some((pattern) => globToRegExp(pattern).test(model));
+}
+
+function configuredProviders(agentDir: string): Set<string> {
+  const models = readJsonSettings(join(agentDir, "models.json"));
+  const providers = models?.providers;
+  return new Set(
+    providers && typeof providers === "object" && !Array.isArray(providers)
+      ? Object.keys(providers)
+      : [],
+  );
+}
+
+/**
+ * Build `provider/modelId` without prefixing twice when settings already store
+ * `provider/modelId`. A model id may itself contain a slash (`group/master`),
+ * so only treat the first segment as a provider when it is the default
+ * provider or a provider declared in models.json.
+ */
+function withProviderPrefix(provider: string, modelId: string, agentDir: string): string {
+  if (modelId.startsWith(`${provider}/`)) return modelId;
+  if (modelId.includes("/")) {
+    const first = modelId.split("/")[0];
+    if (configuredProviders(agentDir).has(first)) return modelId;
+  }
+  return `${provider}/${modelId}`;
+}
+
 /** The last model_change in a pi session file, or null. */
 function lastModelInSession(file: string): string | null {
   try {
@@ -564,8 +625,8 @@ function lastModelInSession(file: string): string | null {
  * `model:`.
  *
  * The parent's current model is not authoritative: a child resolves its own
- * global/project settings, `enabledModels` scoping changes the choice, and a
- * fork inherits the parent session's last model_change. Snapshotting the wrong
+ * settings, project trust controls whether project settings apply, and a fork
+ * inherits the parent session's last model_change. Snapshotting the wrong
  * provider would load the wrong provider/auth extension, so refuse when the
  * effective model cannot be determined reliably.
  */
@@ -586,37 +647,59 @@ function resolveChildInitialModel(opts: {
     };
   }
 
+  // Project settings are only loaded by pi when the project is trusted. Read
+  // them only with a verified `true` decision; otherwise a project file could
+  // silently override the global default and invalidate the snapshot.
+  const trust = projectTrustDecision(opts.agentDir, opts.childCwd);
+  if (trust !== true) {
+    return {
+      error:
+        `project trust for ${opts.childCwd} is not verified as trusted ` +
+        `(${join(opts.agentDir, "trust.json")}); set model: explicitly.`,
+    };
+  }
+
   const globalFile = join(opts.agentDir, "settings.json");
   const projectFile = join(opts.childCwd, ".pi", "settings.json");
   const globalSettings = readJsonSettings(globalFile) ?? {};
   const projectSettings = readJsonSettings(projectFile) ?? {};
   const settings = { ...globalSettings, ...projectSettings };
 
-  const scoped = settings.enabledModels;
-  if (Array.isArray(scoped) && scoped.length > 0) {
+  const provider = typeof settings.defaultProvider === "string" ? settings.defaultProvider.trim() : "";
+  const modelId = typeof settings.defaultModel === "string" ? settings.defaultModel.trim() : "";
+  if (!provider || !modelId) {
     return {
       error:
-        `enabledModels scopes model selection (${scoped.join(", ")}), so the effective default ` +
-        `model cannot be resolved reliably; set model: explicitly.`,
+        `neither ${globalFile} nor ${projectFile} has defaultProvider/defaultModel; ` +
+        `set model: explicitly.`,
     };
   }
-
-  if (
-    typeof settings.defaultProvider === "string" &&
-    settings.defaultProvider.trim() &&
-    typeof settings.defaultModel === "string" &&
-    settings.defaultModel.trim()
-  ) {
+  if (/[*?]/.test(provider) || /[*?]/.test(modelId)) {
     return {
-      model: `${settings.defaultProvider.trim()}/${settings.defaultModel.trim()}`,
+      error: `defaultProvider/defaultModel must be a concrete model, not a pattern; set model: explicitly.`,
     };
   }
 
-  return {
-    error:
-      `neither ${globalFile} nor ${projectFile} has defaultProvider/defaultModel; ` +
-      `set model: explicitly.`,
-  };
+  const model = withProviderPrefix(provider, modelId, opts.agentDir);
+
+  const scoped = settings.enabledModels;
+  if (scoped !== undefined) {
+    if (
+      !Array.isArray(scoped) ||
+      !scoped.every((pattern) => typeof pattern === "string" && pattern.trim())
+    ) {
+      return { error: `enabledModels is not a valid string list; set model: explicitly.` };
+    }
+    if (scoped.length > 0 && !modelMatchesScope(model, scoped)) {
+      return {
+        error:
+          `the default model ${model} is not in enabledModels scope (${scoped.join(", ")}); ` +
+          `the child would start from another scoped model, so set model: explicitly.`,
+      };
+    }
+  }
+
+  return { model };
 }
 
 function resolveLaunchBehavior(

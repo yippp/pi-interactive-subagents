@@ -58,7 +58,7 @@ import {
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import safeBashExtension from "../pi-extension/subagents/tools/safe-bash.ts";
 import { __pollForExitTest__, __layoutTest__, isHerdrDesktopAvailable } from "../pi-extension/subagents/herdr.ts";
-import { resolveBashFor } from "../pi-extension/subagents/shell.ts";
+import { resolveBashFor, requireBash } from "../pi-extension/subagents/shell.ts";
 import {
   exitStateOf,
   freshTabId,
@@ -2985,12 +2985,12 @@ describe("herdr-desktop.ts", () => {
       ["/bin/zsh", "-l", "-i", "-c", "exec bash '/tmp/it'\\''s.sh'"],
     );
     assert.equal(launchArgv("/s.sh", { platform: "linux" })[0], "/bin/sh", "no $SHELL falls back to sh");
-    const win = launchArgv("C:\\s.sh", { platform: "win32" });
+    const win = launchArgv("C:\\s.sh", {
+      platform: "win32",
+      bash: "C:\\Program Files\\Git\\bin\\bash.exe",
+    });
     assert.equal(win[1], "C:\\s.sh");
-    assert.ok(
-      win[0] === "bash" || /bash(?:\.exe)?$/i.test(win[0]),
-      "Windows uses an absolute Git Bash when one is installed",
-    );
+    assert.equal(win[0], "C:\\Program Files\\Git\\bin\\bash.exe");
   });
 
   it("passes absolute Git Bash, script, and cwd paths with spaces as separate hc argv/args", () => {
@@ -3026,9 +3026,31 @@ describe("herdr-desktop.ts", () => {
     );
     assert.equal(
       resolveBashFor("win32", { ProgramFiles: "C:\\Program Files" }, () => false),
-      "bash",
+      null,
+      "no silent bare-bash fallback in the pure resolver",
     );
     assert.equal(resolveBashFor("linux", {}, () => false), "bash");
+  });
+
+  it("rejects a non-absolute configured bash and requires PI_SHELL_PATH in the error", () => {
+    assert.equal(
+      resolveBashFor("win32", { PI_SHELL_PATH: "bash" }, () => false, ""),
+      null,
+      "a bare/relative shellPath is not usable by herdr-core",
+    );
+    assert.throws(
+      () => requireBash("win32", { PI_SHELL_PATH: "bash" }, () => false, ""),
+      /PI_SHELL_PATH[\s\S]*absolute Git Bash[\s\S]*not absolute/,
+    );
+    assert.throws(
+      () => requireBash("win32", {}, () => false, ""),
+      /PI_SHELL_PATH/,
+      "the error must name the override",
+    );
+    assert.equal(
+      requireBash("win32", {}, (path) => path.endsWith("bash.exe"), ""),
+      "C:\\Program Files\\Git\\bin\\bash.exe",
+    );
   });
 
   it("desktop availability honours PI_SUBAGENT_HC_BIN", () => {

@@ -43,7 +43,7 @@ In the Herdr desktop app (`herdr-app`), terminals run in herdr-core and the exte
 - Sub-agents land in the same places: a new named tab for the main session, a split in the parent's tab for nested sub-agents. Neither moves your focus.
 - The app's Agents list nests every sub-agent under the agent that started it, with its status.
 - Nothing is typed into a shell. The launch script runs directly through your login shell, so the pane opens straight into pi with your usual `PATH`. The 500 ms shell-ready delay does not apply.
-- On Windows, herdr-core starts the launch script with an absolute Git Bash (`shellPath`, Program Files Git, or msys64), not a bare `bash` from the registry PATH. `PI_SUBAGENT_HC_BIN` overrides the `hc` binary used for detection and launch.
+- On Windows, herdr-core starts the launch script with an absolute Git Bash (`shellPath`, Program Files Git, or msys64), not a bare `bash` from the registry PATH. If no absolute Bash exists, the desktop launch fails with a `PI_SHELL_PATH` hint instead of trying the WSL stub; the TUI path keeps its bare-bash fallback. `PI_SUBAGENT_HC_BIN` overrides the `hc` binary used for detection and launch.
 - The extension learns that a sub-agent ended from herdr-core, not from its screen. The pane closes when the sub-agent exits.
 - The app chooses the split side, so `PI_SUBAGENT_SPLIT_DIRECTION` and the even pane sizing apply to the TUI only.
 
@@ -168,7 +168,7 @@ You are a specialized agent that does X...
 | ----- | ---- | ----------- |
 | `name` | string | Agent name (used in `agent: "my-agent"`) |
 | `description` | string | Shown in `subagents_list` |
-| `model` | string | Default model. If omitted, the child's settings defaults (with no `enabledModels` scoping) or the fork's recorded model are resolved and pinned; the spawn is refused when that cannot be resolved. The parent's current model is not used |
+| `model` | string | Default model. If omitted, a fork uses its recorded model; otherwise the child must be in a **trusted** project and its settings must provide `defaultProvider` + `defaultModel`, with `enabledModels` either absent or containing the default. The resolved model is pinned and the spawn is refused when this cannot be verified. The parent's current model is not used |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `powershell`, `grep`, `find`, `ls`. Extension-backed tools are resolved through pi's loaded-tool provenance, so npm, git, and local extensions all work (`web_search`, `fetch_content`, `safe_bash`, …). Only the extensions backing the listed tools are loaded into the child. **Omit `tools:` and the child is read-only** (`read`, `grep`, `find`, `ls`) |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagent_wait`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |

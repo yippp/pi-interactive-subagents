@@ -1,6 +1,6 @@
 import { it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import extension, { __test__ as api } from "../pi-extension/subagents/index.ts";
@@ -36,6 +36,15 @@ function loadout(overrides: Partial<SubagentLoadout> = {}): SubagentLoadout {
     agentDir: null,
     ...overrides,
   };
+}
+
+function writeTrust(agentDir: string, cwd: string, decision: boolean) {
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  writeFileSync(
+    join(agentDir, "trust.json"),
+    JSON.stringify({ [realpathSync(cwd)]: decision }),
+  );
 }
 
 function mockExtension(tools: any[] = []) {
@@ -404,7 +413,8 @@ it("pinned provider and auth extensions that disappeared fail before spawn", asy
 it("resolves an omitted model from the child's settings, not the parent model", async () => {
   await withTempDir("pi-child-model-", (dir) => {
     const agentDir = join(dir, "agent");
-    mkdirSync(agentDir, { recursive: true });
+    const repo = join(dir, "repo");
+    writeTrust(agentDir, repo, true);
     writeFileSync(
       join(agentDir, "settings.json"),
       JSON.stringify({ defaultProvider: "magpie", defaultModel: "group/master" }),
@@ -415,18 +425,18 @@ it("resolves an omitted model from the child's settings, not the parent model", 
         sessionMode: "standalone",
         parentSessionFile: join(dir, "parent.jsonl"),
         agentDir,
-        childCwd: join(dir, "repo"),
+        childCwd: repo,
       }),
       { model: "magpie/group/master" },
     );
   });
 });
 
-it("uses project settings defaults for an omitted model", async () => {
+it("uses trusted project settings defaults for an omitted model", async () => {
   await withTempDir("pi-child-project-model-", (dir) => {
     const agentDir = join(dir, "agent");
-    mkdirSync(agentDir, { recursive: true });
     const repo = join(dir, "repo");
+    writeTrust(agentDir, repo, true);
     mkdirSync(join(repo, ".pi"), { recursive: true });
     writeFileSync(
       join(repo, ".pi", "settings.json"),
@@ -445,10 +455,11 @@ it("uses project settings defaults for an omitted model", async () => {
   });
 });
 
-it("refuses an omitted model when enabledModels scopes selection", async () => {
+it("accepts a default model that is inside enabledModels scope", async () => {
   await withTempDir("pi-child-scoped-", (dir) => {
     const agentDir = join(dir, "agent");
-    mkdirSync(agentDir, { recursive: true });
+    const repo = join(dir, "repo");
+    writeTrust(agentDir, repo, true);
     writeFileSync(
       join(agentDir, "settings.json"),
       JSON.stringify({
@@ -457,32 +468,145 @@ it("refuses an omitted model when enabledModels scopes selection", async () => {
         enabledModels: ["magpie/group/*"],
       }),
     );
+    assert.deepEqual(
+      api.resolveChildInitialModel({
+        explicitModel: null,
+        sessionMode: "standalone",
+        parentSessionFile: join(dir, "parent.jsonl"),
+        agentDir,
+        childCwd: repo,
+      }),
+      { model: "magpie/group/master" },
+    );
+  });
+});
+
+it("refuses when the default model is outside enabledModels scope", async () => {
+  await withTempDir("pi-child-out-of-scope-", (dir) => {
+    const agentDir = join(dir, "agent");
+    const repo = join(dir, "repo");
+    writeTrust(agentDir, repo, true);
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({
+        defaultProvider: "magpie",
+        defaultModel: "group/master",
+        enabledModels: ["openrouter/*"],
+      }),
+    );
     const result = api.resolveChildInitialModel({
       explicitModel: null,
       sessionMode: "standalone",
       parentSessionFile: join(dir, "parent.jsonl"),
       agentDir,
-      childCwd: join(dir, "repo"),
+      childCwd: repo,
     });
     assert.ok("error" in result);
-    assert.match(result.error, /enabledModels/);
+    assert.match(result.error, /not in enabledModels scope/);
   });
 });
 
 it("refuses an omitted model when the child settings have no defaults", async () => {
   await withTempDir("pi-child-no-default-", (dir) => {
     const agentDir = join(dir, "agent");
-    mkdirSync(agentDir, { recursive: true });
+    const repo = join(dir, "repo");
+    writeTrust(agentDir, repo, true);
     writeFileSync(join(agentDir, "settings.json"), "{}");
     const result = api.resolveChildInitialModel({
       explicitModel: null,
       sessionMode: "standalone",
       parentSessionFile: join(dir, "parent.jsonl"),
       agentDir,
-      childCwd: join(dir, "repo"),
+      childCwd: repo,
     });
     assert.ok("error" in result);
     assert.match(result.error, /defaultProvider\/defaultModel/);
+  });
+});
+
+it("fails closed when project trust is absent or false, even if settings look valid", async () => {
+  await withTempDir("pi-child-untrusted-", (dir) => {
+    const agentDir = join(dir, "agent");
+    const repo = join(dir, "repo");
+    mkdirSync(agentDir, { recursive: true });
+    mkdirSync(join(repo, ".pi"), { recursive: true });
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ defaultProvider: "magpie", defaultModel: "group/master" }),
+    );
+    // A project file could override the global default; do not silently ignore it.
+    writeFileSync(
+      join(repo, ".pi", "settings.json"),
+      JSON.stringify({ defaultProvider: "openrouter", defaultModel: "z-ai/glm" }),
+    );
+    const untrusted = api.resolveChildInitialModel({
+      explicitModel: null,
+      sessionMode: "standalone",
+      parentSessionFile: join(dir, "parent.jsonl"),
+      agentDir,
+      childCwd: repo,
+    });
+    assert.ok("error" in untrusted);
+    assert.match(untrusted.error, /project trust/);
+
+    writeTrust(agentDir, repo, false);
+    const denied = api.resolveChildInitialModel({
+      explicitModel: null,
+      sessionMode: "standalone",
+      parentSessionFile: join(dir, "parent.jsonl"),
+      agentDir,
+      childCwd: repo,
+    });
+    assert.ok("error" in denied);
+    assert.match(denied.error, /project trust/);
+  });
+});
+
+it("does not double-prefix a defaultModel that already contains the provider", async () => {
+  await withTempDir("pi-child-model-prefix-", (dir) => {
+    const agentDir = join(dir, "agent");
+    const repo = join(dir, "repo");
+    writeTrust(agentDir, repo, true);
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ defaultProvider: "magpie", defaultModel: "magpie/group/master" }),
+    );
+    assert.deepEqual(
+      api.resolveChildInitialModel({
+        explicitModel: null,
+        sessionMode: "standalone",
+        parentSessionFile: join(dir, "parent.jsonl"),
+        agentDir,
+        childCwd: repo,
+      }),
+      { model: "magpie/group/master" },
+    );
+  });
+});
+
+it("keeps a configured provider prefix from models.json instead of stacking providers", async () => {
+  await withTempDir("pi-child-provider-prefix-", (dir) => {
+    const agentDir = join(dir, "agent");
+    const repo = join(dir, "repo");
+    writeTrust(agentDir, repo, true);
+    writeFileSync(
+      join(agentDir, "models.json"),
+      JSON.stringify({ providers: { custom: { models: [] } } }),
+    );
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ defaultProvider: "magpie", defaultModel: "custom/thing" }),
+    );
+    assert.deepEqual(
+      api.resolveChildInitialModel({
+        explicitModel: null,
+        sessionMode: "standalone",
+        parentSessionFile: join(dir, "parent.jsonl"),
+        agentDir,
+        childCwd: repo,
+      }),
+      { model: "custom/thing" },
+    );
   });
 });
 
