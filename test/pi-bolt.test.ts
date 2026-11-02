@@ -1,8 +1,8 @@
 import { it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, basename, isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, basename, isAbsolute, join, resolve, sep, win32 } from "node:path";
 import extension, { __test__ as api } from "../pi-extension/subagents/index.ts";
 import { shellEscape } from "../pi-extension/subagents/herdr.ts";
 import {
@@ -15,6 +15,13 @@ import {
 
 function tempDir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
+}
+
+/** Convert a native Windows path to its Git Bash / MSYS form. */
+function toMsysPath(nativePath: string): string {
+  const match = nativePath.match(/^([A-Za-z]):[\\/](.*)$/);
+  if (!match) throw new Error(`not a drive path: ${nativePath}`);
+  return `/${match[1].toLowerCase()}/${match[2].replace(/\\/g, "/")}`;
 }
 
 function withTempDir(prefix: string, run: (dir: string) => Promise<void> | void) {
@@ -317,9 +324,12 @@ it("Windows absolute cwd is not joined onto the current directory", () => {
     assert.equal(resolved.effectiveCwd, windowsPath);
   }
   const posixPath = join(sep, "tmp", "repo");
+  // On Windows a leading `/` resolves against the current drive, matching
+  // pi's resolvePath(). It must not be joined onto the current directory.
+  const expectedPosix = process.platform === "win32" ? resolve(posixPath) : posixPath;
   assert.equal(
     api.resolveSubagentPaths({ agent: "scout", task: "t", cwd: posixPath }, null).effectiveCwd,
-    posixPath,
+    expectedPosix,
   );
   const relative = api.resolveSubagentPaths({ agent: "scout", task: "t", cwd: "nested" }, null);
   assert.equal(relative.effectiveCwd, join(process.cwd(), "nested"));
@@ -518,9 +528,8 @@ it("uses the parent's actual dir for the same cwd and the child cwd's default fo
 });
 
 it("encodes Windows drive and path dialects without polluting the default tree", () => {
-  const encoded = api.defaultSessionDirPath("G:\\repo\\sub dir", "C:\\agent dir");
-  assert.equal(basename(encoded), "--G--repo-sub dir--");
-  assert.equal(dirname(encoded), join("C:\\agent dir", "sessions"));
+  const encoded = api.defaultSessionDirPath("G:\\repo\\sub dir", "C:\\agent dir", "win32");
+  assert.equal(encoded, win32.join("C:\\agent dir", "sessions", "--G--repo-sub dir--"));
 });
 
 it("normalizes Git Bash/MSYS/Cygwin cwds to the same native encoding as pi", () => {
@@ -544,15 +553,13 @@ it("normalizes Git Bash/MSYS/Cygwin cwds to the same native encoding as pi", () 
 it("encodes a Git Bash cwd identically to its native Windows path", () => {
   const agentDir = "C:\\agent dir";
   const variants = ["/g/repo", "/mnt/g/repo", "/cygdrive/g/repo", "G:\\repo"];
-  const encoded = variants.map((cwd) => api.defaultSessionDirPath(cwd, agentDir));
-  if (process.platform === "win32") {
-    for (const value of encoded) {
-      assert.equal(value, encoded[0], `session group must match for ${variants.join(", ")}`);
-      assert.equal(basename(value), "--G--repo--");
-    }
-  } else {
-    // On POSIX hosts the shell-style paths are ordinary absolute paths.
-    assert.ok(encoded.every((value) => isAbsolute(value)));
+  const expected = win32.join(agentDir, "sessions", "--G--repo--");
+  for (const cwd of variants) {
+    assert.equal(
+      api.defaultSessionDirPath(cwd, agentDir, "win32"),
+      expected,
+      `session group must match for ${cwd}`,
+    );
   }
 });
 
@@ -600,4 +607,149 @@ it("resolves a relative artifact dir against the parent cwd", () => {
   const artifactDir = api.getArtifactDir(relativeSessionDir, "session-1");
   assert.ok(isAbsolute(artifactDir));
   assert.equal(artifactDir, resolve(relativeSessionDir, "artifacts", "session-1"));
+});
+
+// ── Pi path normalization ────────────────────────────────────────────────────
+
+it("normalizes ~ and MSYS paths like pi before any disk access", () => {
+  assert.equal(api.normalizePiPath("~/repo", "win32", "C:\\home"), "C:\\home\\repo");
+  assert.equal(api.normalizePiPath("~", "win32", "C:\\home"), "C:\\home");
+  assert.equal(api.normalizePiPath("/c/repo", "win32"), "C:\\repo");
+  assert.equal(api.normalizePiPath("//server/share/repo", "win32"), "//server/share/repo");
+  assert.equal(
+    api.resolvePiPath("/c/repo", "C:\\base", "win32", "C:\\home"),
+    "C:\\repo",
+  );
+  assert.equal(
+    api.resolvePiPath("sub/../repo", "C:\\base", "win32", "C:\\home"),
+    "C:\\base\\repo",
+  );
+});
+
+it("treats an MSYS cwd as the same real project: cwd, local agent dir, settings, trust, session group", async () => {
+  if (process.platform !== "win32") {
+    // The MSYS mapping is Windows-only; other hosts keep POSIX paths.
+    assert.equal(api.normalizePiPath("/c/repo", "linux"), "/c/repo");
+    return;
+  }
+  await withTempDir("pi-msys-project-", (dir) => {
+    const repo = join(dir, "repo");
+    const localAgentDir = join(repo, ".pi", "agent");
+    mkdirSync(localAgentDir, { recursive: true });
+    // Local agent settings are overridden by trusted project settings.
+    writeFileSync(
+      join(localAgentDir, "settings.json"),
+      JSON.stringify({ defaultProvider: "local-agent", defaultModel: "fallback" }),
+    );
+    writeFileSync(
+      join(repo, ".pi", "settings.json"),
+      JSON.stringify({ defaultProvider: "project", defaultModel: "model" }),
+    );
+    writeFileSync(
+      join(localAgentDir, "trust.json"),
+      JSON.stringify({ [realpathSync(repo)]: true }),
+    );
+
+    const msysCwd = toMsysPath(repo);
+    const resolved = api.resolveSubagentPaths(
+      { agent: "scout", task: "t", cwd: msysCwd },
+      null,
+    );
+    assert.equal(resolved.effectiveCwd, resolve(repo));
+    assert.equal(resolved.localAgentDir, join(repo, ".pi", "agent"));
+    assert.equal(resolved.effectiveAgentDir, join(repo, ".pi", "agent"));
+
+    // Project settings and trust are read from the real project, not C:\c\...
+    const model = api.resolveChildInitialModel({
+      explicitModel: null,
+      sessionMode: "standalone",
+      parentSessionFile: join(dir, "parent.jsonl"),
+      agentDir: resolved.effectiveAgentDir,
+      childCwd: resolved.effectiveCwd!,
+    });
+    assert.deepEqual(model, { model: "project/model" });
+
+    // Passing the raw MSYS cwd and agent dir must reach the same files.
+    assert.deepEqual(
+      api.resolveChildInitialModel({
+        explicitModel: null,
+        sessionMode: "standalone",
+        parentSessionFile: join(dir, "parent.jsonl"),
+        agentDir: toMsysPath(localAgentDir),
+        childCwd: msysCwd,
+      }),
+      { model: "project/model" },
+    );
+
+    // The session group and the parent/child directory comparison use the
+    // same normalized path.
+    const nativeDir = api.defaultSessionDirPath(repo, resolved.effectiveAgentDir);
+    assert.equal(
+      api.defaultSessionDirPath(msysCwd, resolved.effectiveAgentDir),
+      nativeDir,
+    );
+    assert.ok(api.samePath(msysCwd, repo));
+    assert.equal(
+      api.resolveChildSessionDir({
+        parentSessionDir: nativeDir,
+        parentCwd: repo,
+        childCwd: msysCwd,
+        agentDir: resolved.effectiveAgentDir,
+        usesDefaultSessionDir: true,
+      }),
+      nativeDir,
+    );
+  });
+});
+
+it("resolves a relative cwd and an MSYS cwd against the real process cwd", async () => {
+  await withTempDir("pi-relative-cwd-", (dir) => {
+    const repo = join(dir, "repo");
+    mkdirSync(repo, { recursive: true });
+    const previous = process.cwd();
+    try {
+      process.chdir(repo);
+      assert.equal(
+        api.resolveSubagentPaths({ agent: "scout", task: "t", cwd: "." }, null).effectiveCwd,
+        resolve(repo),
+      );
+      assert.equal(
+        api.resolveSubagentPaths({ agent: "scout", task: "t", cwd: "nested/../." }, null)
+          .effectiveCwd,
+        resolve(repo),
+      );
+      if (process.platform === "win32") {
+        assert.equal(
+          api.resolveSubagentPaths({ agent: "scout", task: "t", cwd: toMsysPath(repo) }, null)
+            .effectiveCwd,
+          resolve(repo),
+        );
+      }
+    } finally {
+      process.chdir(previous);
+    }
+  });
+});
+
+it("normalizes an MSYS PI_CODING_AGENT_DIR to the real agent directory", async () => {
+  if (process.platform !== "win32") return;
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  await withTempDir("pi-msys-agent-dir-", (dir) => {
+    const repo = join(dir, "repo");
+    const globalAgent = join(dir, "global agent");
+    mkdirSync(repo, { recursive: true });
+    mkdirSync(globalAgent, { recursive: true });
+    try {
+      process.env.PI_CODING_AGENT_DIR = toMsysPath(globalAgent);
+      const resolved = api.resolveSubagentPaths(
+        { agent: "scout", task: "t", cwd: toMsysPath(repo) },
+        null,
+      );
+      assert.equal(resolved.effectiveAgentDir, resolve(globalAgent));
+      assert.equal(resolved.effectiveCwd, resolve(repo));
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
+  });
 });

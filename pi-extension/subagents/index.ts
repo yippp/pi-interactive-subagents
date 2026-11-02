@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SubagentJoin } from "./join.ts";
 import {
@@ -212,7 +212,10 @@ const READ_ONLY_FALLBACK_TOOLS = ["read", "grep", "find", "ls"] as const;
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  const envDir = process.env.PI_CODING_AGENT_DIR;
+  // pi's getAgentDir() runs the env value through normalizePath(), so a
+  // `~/...` or MSYS `C:/...` value is usable as-is here too.
+  return envDir ? normalizePiPath(envDir) : join(homedir(), ".pi", "agent");
 }
 
 // ── Runtime tool-extension registration ─────────────────────────────────────
@@ -503,11 +506,12 @@ function resolveSubagentPaths(
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
-  const effectiveCwd = rawCwd
-    ? isAbsolute(rawCwd)
-      ? rawCwd
-      : join(cwdBase, rawCwd)
-    : null;
+  // Normalize like pi's resolvePath(): `~` expansion and MSYS/Cygwin/WSL drive
+  // paths become native Windows paths before anything touches the disk. On
+  // Windows a raw `/c/.../repo` would otherwise be joined into `C:\c\...\repo`,
+  // so project settings, trust, the local agent dir, and the `cd` prefix would
+  // all point at the wrong place.
+  const effectiveCwd = rawCwd ? resolvePiPath(rawCwd, cwdBase) : null;
   const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
   const effectiveAgentDir =
     localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
@@ -534,32 +538,65 @@ export function normalizeWindowsShellPath(
   return `${match[1].toUpperCase()}:\\${suffix ?? ""}`;
 }
 
-/** Resolve a cwd the way pi does before encoding a session directory. */
-function resolvedCwdForEncoding(cwd: string): string {
-  // pi's resolvePath() calls normalizePath() first, so a shell-style drive path
-  // becomes a native Windows path before it is resolved and encoded. Without
-  // this, `/g/repo` and `G:\repo` would produce different session groups and
-  // the session would not be discoverable.
-  return resolve(normalizeWindowsShellPath(cwd));
+/**
+ * Copy of pi's normalizePath(): MSYS/Cygwin/WSL drive conversion, `~` expansion,
+ * and `file://` URL decoding. Used before any path touches the disk so the
+ * child cwd, project settings, agent dir, session group, and launch `cd` all
+ * agree.
+ */
+export function normalizePiPath(
+  input: string,
+  platform: NodeJS.Platform = process.platform,
+  home: string = homedir(),
+): string {
+  const pathApi = platform === "win32" ? win32 : posix;
+  let normalized = input;
+  if (platform === "win32") normalized = normalizeWindowsShellPath(normalized, platform);
+  if (normalized === "~") return home;
+  if (normalized.startsWith("~/") || (platform === "win32" && normalized.startsWith("~\\"))) {
+    return pathApi.join(home, normalized.slice(2));
+  }
+  if (/^file:\/\//.test(normalized)) return fileURLToPath(normalized);
+  return normalized;
 }
 
-function defaultSessionDirPath(cwd: string, agentDir: string): string {
+/** pi's resolvePath(): normalize, then resolve against `baseDir` when relative. */
+export function resolvePiPath(
+  input: string,
+  baseDir: string = process.cwd(),
+  platform: NodeJS.Platform = process.platform,
+  home: string = homedir(),
+): string {
+  const pathApi = platform === "win32" ? win32 : posix;
+  const normalized = normalizePiPath(input, platform, home);
+  const normalizedBaseDir = normalizePiPath(baseDir, platform, home);
+  return pathApi.isAbsolute(normalized)
+    ? pathApi.resolve(normalized)
+    : pathApi.resolve(normalizedBaseDir, normalized);
+}
+
+function defaultSessionDirPath(
+  cwd: string,
+  agentDir: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
   // Mirrors pi's getDefaultSessionDirPath: resolvePath() first (native path,
   // absolute, normalized, no trailing separator / `.` / `..`), then the Windows
   // drive-colon encoding (`G:\repo` -> `--G--repo--`). Pure: callers choose
   // whether to create the directory, so an explicit --session-dir is never
   // polluted with an unused default directory.
-  const resolvedCwd = resolvedCwdForEncoding(cwd);
-  const resolvedAgentDir = resolve(normalizeWindowsShellPath(agentDir));
+  const pathApi = platform === "win32" ? win32 : posix;
+  const resolvedCwd = resolvePiPath(cwd, process.cwd(), platform);
+  const resolvedAgentDir = resolvePiPath(agentDir, process.cwd(), platform);
   const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-  return join(resolvedAgentDir, "sessions", safePath);
+  return pathApi.join(resolvedAgentDir, "sessions", safePath);
 }
 
 function samePath(a: string, b: string): boolean {
   // Normalize shell-style drive paths first, so a parent in `G:\repo` and a
   // child cwd `/g/repo` are recognized as the same directory.
-  const left = canonicalizePath(resolve(normalizeWindowsShellPath(a)));
-  const right = canonicalizePath(resolve(normalizeWindowsShellPath(b)));
+  const left = canonicalizePath(resolvePiPath(a));
+  const right = canonicalizePath(resolvePiPath(b));
   return process.platform === "win32"
     ? left.toLowerCase() === right.toLowerCase()
     : left === right;
@@ -585,8 +622,8 @@ function resolveChildSessionDir(opts: {
   agentDir: string;
   usesDefaultSessionDir: boolean;
 }): string {
-  const parentBase = resolve(opts.parentCwd);
-  const parentDir = resolve(parentBase, opts.parentSessionDir);
+  const parentBase = resolvePiPath(opts.parentCwd);
+  const parentDir = resolvePiPath(opts.parentSessionDir, parentBase);
   if (!opts.usesDefaultSessionDir) return parentDir;
   if (samePath(opts.parentCwd, opts.childCwd)) return parentDir;
   return defaultSessionDirPath(opts.childCwd, opts.agentDir);
@@ -823,7 +860,11 @@ function resolveChildInitialModel(opts: {
   // pi's order: explicit trust-store decision, then defaultProjectTrust; an
   // unresolved `ask`, an unreadable store, or project extensions fail closed.
   // An untrusted project file is never read.
-  const globalFile = join(opts.agentDir, "settings.json");
+  // Normalize both paths first: a Git Bash/MSYS cwd or agent dir must address
+  // the real directory, not `C:\c\...` on Windows.
+  const childCwd = resolvePiPath(opts.childCwd);
+  const agentDir = resolvePiPath(opts.agentDir);
+  const globalFile = join(agentDir, "settings.json");
   const globalLoad = loadSettingsFile(globalFile);
   if (globalLoad.kind === "invalid") {
     return {
@@ -832,12 +873,12 @@ function resolveChildInitialModel(opts: {
   }
   const globalSettings = globalLoad.kind === "ok" ? globalLoad.value : {};
 
-  const projectFile = join(opts.childCwd, ".pi", "settings.json");
+  const projectFile = join(childCwd, ".pi", "settings.json");
   let projectSettings: Record<string, any> = {};
   if (existsSync(projectFile)) {
     const trust = resolveProjectSettingsTrust({
-      agentDir: opts.agentDir,
-      childCwd: opts.childCwd,
+      agentDir,
+      childCwd,
       globalSettings,
     });
     if ("error" in trust) return trust;
@@ -871,7 +912,7 @@ function resolveChildInitialModel(opts: {
     };
   }
 
-  const model = withProviderPrefix(provider, modelId, opts.agentDir);
+  const model = withProviderPrefix(provider, modelId, agentDir);
 
   const scoped = settings.enabledModels;
   if (scoped !== undefined) {
@@ -1820,6 +1861,9 @@ export const __test__ = {
   resolveChildSessionDir,
   defaultSessionDirPath,
   normalizeWindowsShellPath,
+  normalizePiPath,
+  resolvePiPath,
+  samePath,
   getArtifactDir,
   lastModelInSession,
   watchSubagentWithRetry,
@@ -1900,7 +1944,7 @@ async function launchSubagent(
       explicitModel: null,
       sessionMode: launchBehavior.sessionMode,
       parentSessionFile: sessionFile,
-      agentDir: localAgentDir && existsSync(localAgentDir) ? localAgentDir : process.env.PI_CODING_AGENT_DIR ?? getAgentConfigDir(),
+      agentDir: localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir(),
       childCwd: targetCwdForSession,
     });
     if ("error" in resolved) {
