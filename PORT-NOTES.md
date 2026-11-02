@@ -196,11 +196,15 @@ no per-server isolation for MCP.
 ## Switch blockers (unverified, do not replace the active package until checked)
 
 1. Windows herdr-core 0.1.17 was tested headlessly with the desktop backend:
-   an isolated 65-check probe covered child launch, message delivery, exit
-   status, cleanup, and a real `pi-bolt.exe --version` invocation. The probe
-   did not run a model request or validate the GUI layout.
-2. A full live Herdr TUI or desktop subagent task and resume remain unverified.
-3. The executable probe did not test `pi-bolt.exe --session ...` in a pane.
+   a 65-check probe covered child launch, message delivery, exit status,
+   cleanup, and `pi-bolt.exe --version`. Two subsequent real Pi-Bolt/model
+   tasks on commit `c691bcb` tested result delivery and `subagent_wait` while
+   the child was running, including same-cwd and cross-cwd cases. A custom
+   absolute session directory kept both child sessions outside the default
+   session tree. A further real Pi-Bolt/model task on commit `08e0f24`
+   verified a relative session directory and a cross-project `/c/...` cwd,
+   result delivery, and an in-flight wait. GUI layout remains unverified.
+2. Live Herdr TUI spawn/resume and desktop resume remain unverified.
 4. `getAllTools().sourceInfo` was exercised through a mocked extension API.
    The installed pi-web-access package does register `fetch_content`,
    `get_search_content`, and `source_check`, but a live parent was not queried.
@@ -219,12 +223,9 @@ no per-server isolation for MCP.
    answered while a tool call is blocked.
 8. `npm run test:integration` was not run: it starts live pi sessions and model
    requests in Herdr surfaces.
-9. The Windows cwd fix is covered by a unit test on win32, not by a live spawn
-   with a drive-letter cwd.
-10. Child session placement is covered by unit tests only. The real
-    `--session-dir` + Pi-Bolt E2E should be rerun after this fix to confirm no
-    session file appears under `~/.pi/agent/sessions` and that resume/fork
-    still work.
+9. Native Windows cwd, a Git Bash `/c/...` cwd, and both absolute and relative
+   custom session-directory placement were exercised in headless Core; live
+   resume/fork across cwd remains unverified.
 11. Only `antigravity-acp` and the upstream Anthropic auth extension have
     provider mappings. Other extension-provided providers need an entry or
     `registerProviderExtension`.
