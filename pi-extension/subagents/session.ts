@@ -111,6 +111,12 @@ export interface SubagentLoadout {
    * and retry cannot re-derive that provider from the snapshot alone.
    */
   providerExtensions?: string[];
+  /**
+   * Anthropic OAuth transport extension resolved at spawn time (or null when
+   * none applied). Stored so a profile without `model:` still replays the
+   * host's default Anthropic OAuth transport on resume/retry.
+   */
+  providerAuthExtension?: string | null;
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */

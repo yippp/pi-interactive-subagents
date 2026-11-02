@@ -784,6 +784,10 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  /** Session lines that predate this run; only newer output is summarized. */
+  entryCountBefore?: number;
+  /** True while the run is being resumed after a provider/agent error. */
+  retrying?: boolean;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1028,6 +1032,14 @@ function resolveToolExtensions(
     if (BUILTIN_TOOLS.has(tool)) continue;
     const path = pinned?.[tool] ?? getToolExtensionPath(tool);
     if (!path || !isAbsolute(path) || !existsSync(path)) {
+      // `builtin:mcp` is a gateway, not a per-tool extension. Loading it with
+      // -e would connect every configured MCP server and expose its tools to
+      // the child, which is broader than the grant. Keep refusing it.
+      if (tool.startsWith("mcp__") || tool.startsWith("mcp_")) {
+        throw new Error(
+          `MCP tool "${tool}" cannot be granted to a restricted subagent: loading builtin:mcp would expose every configured MCP server, not just this tool. Remove MCP tools from the profile's tools list, or expose this tool through a dedicated extension and registerToolExtension(name, path).`,
+        );
+      }
       throw new Error(
         `Cannot load subagent tool "${tool}". Load its backing extension in the parent or registerToolExtension(name, path). Check tool names: fetch_content, not web_fetch.`,
       );
@@ -1097,18 +1109,33 @@ function applySandboxToParts(
       }
       extPaths.add(extPath);
     }
-    // Anthropic OAuth subscription auth is a transport extension, not a tool;
-    // keep the upstream behaviour of loading it for `anthropic/` OAuth models.
-    const authExtPath = getProviderAuthExtensionPath(loadout.model);
-    if (authExtPath) extPaths.add(authExtPath);
+    // Anthropic OAuth subscription auth is a transport extension, not a tool.
+    // Prefer the spawn-time snapshot: a profile may omit `model:` and use the
+    // host's default Anthropic OAuth model, which cannot be re-derived here.
+    const authExtPath =
+      loadout.providerAuthExtension === undefined
+        ? getProviderAuthExtensionPath(loadout.model)
+        : loadout.providerAuthExtension;
+    if (authExtPath) {
+      if (!existsSync(authExtPath)) {
+        throw new Error(
+          `Cannot load pinned Anthropic auth extension "${authExtPath}". Reinstall the package, or spawn a fresh subagent so the path is re-resolved.`,
+        );
+      }
+      extPaths.add(authExtPath);
+    }
     // Restricted children run with --no-extensions, so a model provider
     // implemented by an extension must be re-enabled explicitly. Prefer the
-    // spawn-time snapshot: a profile may omit `model:` and use the child's own
-    // default, which cannot be re-derived from the loadout at resume time.
+    // spawn-time snapshot for the same null-model reason as above.
     const providerExts =
       loadout.providerExtensions ?? providerExtensionsForModel(loadout.model);
     for (const providerExt of providerExts) {
-      if (existsSync(providerExt)) extPaths.add(providerExt);
+      if (!existsSync(providerExt)) {
+        throw new Error(
+          `Cannot load pinned provider extension "${providerExt}". Reinstall it, or spawn a fresh subagent so the path is re-resolved.`,
+        );
+      }
+      extPaths.add(providerExt);
     }
     for (const extPath of extPaths) {
       parts.push("-e", shellEscape(extPath));
@@ -1242,6 +1269,13 @@ function steerSubagent(
   message: string,
   send: (surface: string, command: string) => void = sendMessage,
 ): { ok: true } | { error: string } {
+  if (running.retrying) {
+    return {
+      error:
+        `Subagent "${running.name}" is restarting after a provider error. ` +
+        `Wait for the retry result before sending another message.`,
+    };
+  }
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
     send(running.surface, flattened);
@@ -1402,6 +1436,8 @@ export const __test__ = {
   SUBAGENT_RETRY_MAX,
   resolveSubagentPaths,
   resolveChildPiBin,
+  watchSubagentWithRetry,
+  summarizeAttempt,
 };
 
 function startWidgetRefresh() {
@@ -1614,6 +1650,10 @@ async function launchSubagent(
       agentDefs?.cli === "claude"
         ? undefined
         : providerExtensionsForModel(effectiveModel ?? parentModel),
+    providerAuthExtension:
+      agentDefs?.cli === "claude"
+        ? undefined
+        : getProviderAuthExtensionPath(effectiveModel ?? parentModel),
     model: effectiveModel ?? null,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
@@ -1695,6 +1735,9 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+  // Seeded fork/lineage sessions already contain parent entries. Baseline
+  // after seeding so the result summary only covers this child's own output.
+  const entryCountBefore = countSessionEntryLines(subagentSessionFile);
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
@@ -1715,6 +1758,7 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    entryCountBefore,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1729,8 +1773,9 @@ async function launchSubagent(
 
 /**
  * Watch a launched subagent until it exits. Polls for completion, extracts
- * the summary from the session file, cleans up the surface,
- * and removes the entry from runningSubagents.
+ * the summary from the session file, and cleans up the surface. The caller
+ * (`watchSubagentWithRetry`) owns the running-map entry so an automatic retry
+ * can keep the run's identity across attempts.
  */
 const CLAUDE_SESSIONS_DIR = join(
   process.env.HOME ?? "/tmp",
@@ -1846,7 +1891,6 @@ async function watchSubagent(
       }
 
       closeSurface(surface);
-      runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
@@ -1874,7 +1918,6 @@ async function watchSubagent(
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
     closeSurface(surface);
-    runningSubagents.delete(running.id);
 
     return {
       name,
@@ -1891,7 +1934,6 @@ async function watchSubagent(
     try {
       closeSurface(surface);
     } catch {}
-    runningSubagents.delete(running.id);
 
     if (signal.aborted) {
       return {
@@ -2024,7 +2066,7 @@ function buildResumeCommand(params: {
  * nudge. Registers the run again: join entries are keyed by name, so the new id
  * supersedes the finished attempt and `subagent_wait` keeps waiting.
  */
-async function retrySubagentRun(opts: {
+interface RetryRunOptions {
   id: string;
   name: string;
   task: string;
@@ -2035,7 +2077,13 @@ async function retrySubagentRun(opts: {
   errorMessage: string;
   attempt: number;
   maxAttempts: number;
-}): Promise<{ running: RunningSubagent; entryCountBefore: number } | { error: string }> {
+}
+
+type RetryRunOutcome =
+  | { running: RunningSubagent; entryCountBefore: number }
+  | { error: string };
+
+async function retrySubagentRun(opts: RetryRunOptions): Promise<RetryRunOutcome> {
   const startTime = Date.now();
   // Reuse the run id. The join is keyed by name, and keeping the same id means
   // an in-flight subagent_wait keeps waiting instead of returning
@@ -2116,126 +2164,249 @@ function fallbackExitSummary(result: SubagentResult): string {
 }
 
 /**
- * Watch a run to completion, retrying provider/agent failures by resuming the
- * same session, and deliver exactly one result steer message. The join entry is
- * finished for every terminal path so `subagent_wait` never hangs on it.
+ * Injection seam for the retry loop. Production uses the defaults below; tests
+ * replace them to exercise retries, unreadable transcripts, and delivery errors
+ * without a multiplexer or a model call.
  */
-async function watchSubagentWithRetry(opts: {
-  running: RunningSubagent;
-  signal: AbortSignal;
-  ctx: { sessionManager: { getSessionId(): string; getSessionDir(): string } };
-  /** Session lines that predate this run; only newer output is summarized. */
-  entryCountBefore: number;
-}): Promise<void> {
+interface WatchDeps {
+  watch(running: RunningSubagent, signal: AbortSignal): Promise<SubagentResult>;
+  retry(options: RetryRunOptions): Promise<RetryRunOutcome>;
+  deliver(content: string, details: Record<string, unknown>): void;
+  finish(id: string, name: string, failed: boolean): void;
+  remove(id: string): void;
+  summarize(
+    running: RunningSubagent,
+    entryCountBefore: number,
+    result: SubagentResult,
+  ): string;
+}
+
+/**
+ * Extract this attempt's assistant summary. Missing or corrupt transcripts are
+ * reported as part of the result instead of throwing inside the watcher.
+ */
+function summarizeAttempt(
+  running: RunningSubagent,
+  entryCountBefore: number,
+  result: SubagentResult,
+): string {
+  if (running.cli === "claude") return result.summary || fallbackExitSummary(result);
+  try {
+    return (
+      findLastAssistantMessage(getNewEntries(running.sessionFile, entryCountBefore)) ??
+      fallbackExitSummary(result)
+    );
+  } catch (error: any) {
+    return (
+      `${fallbackExitSummary(result)}\n\n` +
+      `Session transcript could not be read: ${error?.message ?? String(error)}`
+    );
+  }
+}
+
+function defaultWatchDeps(): WatchDeps {
+  return {
+    watch: watchSubagent,
+    retry: retrySubagentRun,
+    deliver(content, details) {
+      latestPi?.sendMessage(
+        {
+          customType: "subagent_result",
+          content,
+          display: true,
+          details,
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    },
+    finish(id, name, failed) {
+      joins.finish(id, name, failed);
+    },
+    remove(id) {
+      runningSubagents.delete(id);
+    },
+    summarize: summarizeAttempt,
+  };
+}
+
+/**
+ * Watch a run to completion, retrying provider/agent failures by resuming the
+ * same session, and deliver exactly one result steer message. The run keeps its
+ * `runningSubagents` identity until the final state so a `subagent_message`
+ * cannot resume the same session while an automatic retry is pending. The join
+ * is finished on every terminal path, and all failures are caught so a
+ * fire-and-forget call cannot leave an unhandled rejection or a hanging wait.
+ */
+async function watchSubagentWithRetry(
+  opts: {
+    running: RunningSubagent;
+    signal: AbortSignal;
+    ctx: { sessionManager: { getSessionId(): string; getSessionDir(): string } };
+    /** Session lines that predate this run; only newer output is summarized. */
+    entryCountBefore: number;
+  },
+  deps: WatchDeps = defaultWatchDeps(),
+): Promise<void> {
   const maxAttempts = SUBAGENT_RETRY_MAX + 1;
   let running = opts.running;
   let signal = opts.signal;
   let attempt = 1;
   let entryCountBefore = opts.entryCountBefore;
+  let settled = false;
 
-  for (;;) {
-    let result: SubagentResult;
+  const finalize = (failed: boolean) => {
+    if (settled) return;
+    settled = true;
     try {
-      result = await watchSubagent(running, signal);
-    } catch (err: any) {
-      joins.finish(running.id, running.name, true);
-      if (signal.aborted || getModuleAbortSignal().aborted) return;
+      deps.finish(running.id, running.name, failed);
+    } catch {}
+    try {
+      deps.remove(running.id);
+    } catch {}
+  };
+
+  try {
+    for (;;) {
+      let result: SubagentResult;
+      try {
+        result = await deps.watch(running, signal);
+      } catch (err: any) {
+        finalize(true);
+        if (signal.aborted || getModuleAbortSignal().aborted) return;
+        updateWidget();
+        deps.deliver(`Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`, {
+          name: running.name,
+          task: running.task,
+          error: err?.message,
+        });
+        return;
+      }
+
       updateWidget();
+      if (signal.aborted || getModuleAbortSignal().aborted) {
+        finalize(true);
+        return;
+      }
+
+      // Provider/agent error with attempts left: resume the session instead of
+      // reporting failure. Claude subagents keep their existing behaviour.
+      if (result.errorMessage && attempt < maxAttempts && running.cli !== "claude") {
+        const artifactDir = getArtifactDir(
+          opts.ctx.sessionManager.getSessionDir(),
+          opts.ctx.sessionManager.getSessionId(),
+        );
+        const loadout = readSubagentLoadout(running.sessionFile);
+        if (loadout) {
+          // Keep the entry visible as running while the retry starts; steering
+          // it now would target the closed surface of the failed attempt.
+          running.retrying = true;
+          const retry = await deps.retry({
+            id: running.id,
+            name: running.name,
+            task: running.task,
+            ...(running.agent ? { agent: running.agent } : {}),
+            sessionPath: running.sessionFile,
+            loadout,
+            artifactDir,
+            errorMessage: result.errorMessage,
+            attempt,
+            maxAttempts,
+          });
+          if ("running" in retry) {
+            running = retry.running;
+            signal = running.abortController?.signal ?? new AbortController().signal;
+            entryCountBefore = retry.entryCountBefore;
+            attempt += 1;
+            continue;
+          }
+          result = {
+            ...result,
+            errorMessage:
+              `${result.errorMessage}\n` +
+              `(retry attempt ${attempt + 1} could not start: ${retry.error})`,
+          };
+        }
+      }
+
+      // Compute the summary before finalizing: a summary failure must mark the
+      // run failed instead of leaving a completed status on a broken result.
+      // Only this attempt's new assistant output belongs in the result. Using
+      // the whole session would report the previous turn (or the failed
+      // attempt) as the outcome of a retry that produced no new output.
+      const summary = deps.summarize(running, entryCountBefore, result);
+      const presentation = resolveResultPresentation(
+        { ...result, summary, sessionFile: running.sessionFile },
+        running.name,
+      );
+
+      finalize(result.exitCode !== 0);
+      updateWidget();
+
+      deps.deliver(presentation, {
+        name: running.name,
+        task: running.task,
+        agent: running.agent,
+        exitCode: result.exitCode,
+        elapsed: result.elapsed,
+        sessionFile: running.sessionFile,
+        attempts: attempt,
+        ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+        ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+        ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+        ...(result.stats ? { stats: result.stats } : {}),
+      });
+      return;
+    }
+  } catch (error: any) {
+    // Retry, summary, or delivery threw. Finish the join and remove the run,
+    // then report once through the same steer channel. If delivery itself is
+    // what failed, the second attempt is still guarded.
+    finalize(true);
+    updateWidget();
+    if (signal.aborted || getModuleAbortSignal().aborted) return;
+    try {
+      deps.deliver(`Sub-agent "${running.name}" watcher failed: ${error?.message ?? String(error)}`, {
+        name: running.name,
+        task: running.task,
+        error: error?.message ?? String(error),
+      });
+    } catch {}
+  }
+}
+
+/**
+ * Start a fire-and-forget watcher with a final rejection guard. The watcher
+ * handles its own failures; this catch exists so an unexpected rejection can
+ * never leave an unhandled promise or a join entry stuck in `running`.
+ */
+function startSubagentWatcher(opts: {
+  running: RunningSubagent;
+  signal: AbortSignal;
+  ctx: { sessionManager: { getSessionId(): string; getSessionDir(): string } };
+  entryCountBefore: number;
+}): void {
+  void watchSubagentWithRetry(opts).catch((error: any) => {
+    try {
+      joins.finish(opts.running.id, opts.running.name, true);
+    } catch {}
+    runningSubagents.delete(opts.running.id);
+    if (opts.signal.aborted || getModuleAbortSignal().aborted) return;
+    try {
       latestPi?.sendMessage(
         {
           customType: "subagent_result",
-          content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+          content: `Sub-agent "${opts.running.name}" watcher failed: ${error?.message ?? String(error)}`,
           display: true,
-          details: { name: running.name, task: running.task, error: err?.message },
+          details: {
+            name: opts.running.name,
+            task: opts.running.task,
+            error: error?.message ?? String(error),
+          },
         },
         { triggerTurn: true, deliverAs: "steer" },
       );
-      return;
-    }
-
-    updateWidget();
-    if (signal.aborted || getModuleAbortSignal().aborted) {
-      joins.finish(running.id, running.name, true);
-      return;
-    }
-
-    // Provider/agent error with attempts left: resume the session instead of
-    // reporting failure. Claude subagents keep their existing behaviour.
-    if (result.errorMessage && attempt < maxAttempts && running.cli !== "claude") {
-      const artifactDir = getArtifactDir(
-        opts.ctx.sessionManager.getSessionDir(),
-        opts.ctx.sessionManager.getSessionId(),
-      );
-      const loadout = readSubagentLoadout(running.sessionFile);
-      if (loadout) {
-        const retry = await retrySubagentRun({
-          id: running.id,
-          name: running.name,
-          task: running.task,
-          ...(running.agent ? { agent: running.agent } : {}),
-          sessionPath: running.sessionFile,
-          loadout,
-          artifactDir,
-          errorMessage: result.errorMessage,
-          attempt,
-          maxAttempts,
-        });
-        if ("running" in retry) {
-          running = retry.running;
-          signal = running.abortController?.signal ?? new AbortController().signal;
-          entryCountBefore = retry.entryCountBefore;
-          attempt += 1;
-          continue;
-        }
-        result = {
-          ...result,
-          errorMessage:
-            `${result.errorMessage}\n` +
-            `(retry attempt ${attempt + 1} could not start: ${retry.error})`,
-        };
-      }
-    }
-
-    joins.finish(running.id, running.name, result.exitCode !== 0);
-    updateWidget();
-
-    // Only this attempt's new assistant output belongs in the result. Using
-    // the whole session would report the previous turn (or the failed
-    // attempt) as the outcome of a retry that produced no new output.
-    const summary =
-      running.cli === "claude"
-        ? result.summary || fallbackExitSummary(result)
-        : (findLastAssistantMessage(
-            getNewEntries(running.sessionFile, entryCountBefore),
-          ) ?? fallbackExitSummary(result));
-    const presentation = resolveResultPresentation(
-      { ...result, summary, sessionFile: running.sessionFile },
-      running.name,
-    );
-
-    latestPi?.sendMessage(
-      {
-        customType: "subagent_result",
-        content: presentation,
-        display: true,
-        details: {
-          name: running.name,
-          task: running.task,
-          agent: running.agent,
-          exitCode: result.exitCode,
-          elapsed: result.elapsed,
-          sessionFile: running.sessionFile,
-          attempts: attempt,
-          ...(result.sessionId ? { sessionId: result.sessionId } : {}),
-          ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-          ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
-          ...(result.stats ? { stats: result.stats } : {}),
-        },
-      },
-      { triggerTurn: true, deliverAs: "steer" },
-    );
-    return;
-  }
+    } catch {}
+  });
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
@@ -2504,11 +2675,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Fire-and-forget: start watching in background. Provider/agent errors
         // resume the same session before failure is reported.
-        void watchSubagentWithRetry({
+        startSubagentWatcher({
           running,
           signal: watcherAbort.signal,
           ctx,
-          entryCountBefore: 0,
+          entryCountBefore: running.entryCountBefore ?? 0,
         });
 
         // Return immediately
@@ -2863,7 +3034,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        void watchSubagentWithRetry({
+        startSubagentWatcher({
           running,
           signal: watcherAbort.signal,
           ctx,

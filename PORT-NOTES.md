@@ -29,6 +29,12 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   `subagent_wait` keeps waiting instead of returning `runtime_changed`.
   Summaries use only entries written after the attempt started, so a retry
   that produces no new assistant output cannot report the previous answer.
+  The failed run keeps its `runningSubagents` identity until the retry reaches a
+  terminal state; `subagent_message` on a retrying run returns a clear error
+  instead of racing a second process onto the same session file. All watcher
+  failures (retry, summary, delivery) are caught, finish the join, remove the
+  run, and report once. Missing or corrupt session transcripts are reported in
+  the result rather than thrown.
 - Provider-extension snapshot — `SubagentLoadout.providerExtensions` records
   the provider extension resolved at spawn time. This covers profiles that
   omit `model:` and therefore use the child's own default, which resume cannot
@@ -77,16 +83,20 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 196 tests, 196 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 206 tests, 206 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
   works if `PI_SUBAGENT_ALLOWED` is unset.
 - Added tests: `test/join.test.ts` (all/any, timeout, abort, question, blocked,
-  stale generation, reset) and `test/pi-bolt.test.ts` (read-only default,
+  stale generation, reset), `test/pi-bolt.test.ts` (read-only default,
   legacy snapshot refusal, provenance for pi-web-access tool names, bundled
   agent tool resolution, pinned paths, provider and Anthropic extensions,
   provider snapshot for a null model, Windows cwd, Pi-Bolt binary resolution,
-  shared resume command, wait tool statuses and question release).
+  shared resume command, wait tool statuses and question release), and
+  `test/retry.test.ts` (retry success with the same run id, exhaustion,
+  retry-start failure, retry/summary/delivery exceptions, missing and corrupt
+  transcripts, seeded-session summary baseline, parallel retries, MCP refusal,
+  pinned provider/auth failure, null-model auth snapshot).
 - Bundled `researcher` and `worker` now request `fetch_content` instead of the
   removed `web_fetch`; with the new hard failure, `web_fetch` made both agents
   impossible to spawn on a clean install. The README agent table was corrected
@@ -95,6 +105,17 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   surface, and closes the surface if the launch write fails.
 - Updated upstream tests for the intentional behavior changes and for Windows
   path separators.
+
+## MCP tools are deliberately unsupported in restricted subagents
+
+`builtin:mcp` is a gateway, not a per-tool extension. Passing `-e builtin:mcp`
+would connect every configured MCP server and expose its tools to the child,
+which is wider than a single granted tool. The sandbox therefore never emits a
+`builtin:` path: builtin provenance is filtered out of tool resolution, and an
+`mcp__*` / `mcp_*` tool in a profile fails with an explicit error instead of
+silently disappearing. Parent MCP use is unaffected. To grant one MCP tool to a
+child, wrap it in a dedicated extension that registers only that tool and call
+`registerToolExtension(name, path)`; there is no per-server isolation for MCP.
 
 ## Switch blockers (unverified, do not replace the active package until checked)
 
@@ -110,10 +131,10 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
    Run `/subagent-doctor` in the target session to confirm the real paths.
 4. The provider extension path was tested with a temporary fixture matching the
    real npm layout, not with a live `antigravity-acp/*` model call.
-5. The retry loop was not exercised against a reproducible provider failure.
-   `retryNudge`, `buildResumeCommand`, defaults, summary baselines, and the
-   same-id join behavior are covered, but no child was actually resumed after
-   an upstream error.
+5. The retry loop is covered with injected dependencies, not a real provider
+   failure. `retryNudge`, `buildResumeCommand`, defaults, summary baselines,
+   retry/summary/delivery exceptions, and the same-id join behavior are tested,
+   but no child was actually resumed after an upstream error.
 6. A native blocked-UI signal is not wired into joins. The join class supports
    `blocked`, but this upstream has no poll event for Herdr `agent_blocked`
    (it only surfaces as a steer error). `ask_question` early return is wired
@@ -127,3 +148,6 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 9. Only `antigravity-acp` and the upstream Anthropic auth extension have
    provider mappings. Other extension-provided providers need an entry or
    `registerProviderExtension`.
+10. The fork/lineage summary baseline is tested at the `summarizeAttempt`
+    level, not by spawning a real seeded fork session. Verify with a live fork
+    run before relying on the last-message summary.

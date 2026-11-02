@@ -15,6 +15,7 @@ const files = [
   "test/test.ts",
   "test/join.test.ts",
   "test/pi-bolt.test.ts",
+  "test/retry.test.ts",
 ];
 
 const env = { ...process.env };

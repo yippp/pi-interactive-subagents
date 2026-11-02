@@ -71,7 +71,14 @@ prefix (`antigravity-acp`); the Anthropic OAuth transport extension is kept.
 
 A run that ends with a provider/agent error is resumed in a fresh surface with
 the same session and a continuation message. Default: 3 extra attempts; set
-`PI_SUBAGENT_RETRY_MAX=0` to disable.
+`PI_SUBAGENT_RETRY_MAX=0` to disable. The run keeps its name while restarting,
+so `subagent_message` returns "restarting" instead of opening the same session
+a second time.
+
+MCP tools (`mcp__*`) cannot be granted to a restricted child. `builtin:mcp` is a
+gateway: loading it with `-e` would connect every configured MCP server, not
+just the requested tool. Use a dedicated extension that registers the single
+tool, or keep MCP work in the parent. The parent's MCP servers are unaffected.
 
 Run `/subagent-doctor` to print each agent's resolved allowlist and extension
 paths, provider-extension status, and Herdr availability. It does not call a
