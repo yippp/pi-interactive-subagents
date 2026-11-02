@@ -151,3 +151,6 @@ child, wrap it in a dedicated extension that registers only that tool and call
 10. The fork/lineage summary baseline is tested at the `summarizeAttempt`
     level, not by spawning a real seeded fork session. Verify with a live fork
     run before relying on the last-message summary.
+11. The null-model provider/auth snapshots read `ctx.model` at spawn. A host
+    that does not expose the current model there cannot snapshot it; the child
+    then falls back to no provider/auth extension re-enable on resume.
