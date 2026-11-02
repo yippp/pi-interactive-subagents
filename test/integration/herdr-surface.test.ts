@@ -83,29 +83,67 @@ for (const backend of backends) {
       assert.equal(getFocusedSurface(), anchor);
     });
 
-    it("opens a tab for a main-session subagent and keeps a nested subagent's child in that tab", async () => {
+    it("opens a pane in the parent tab for a main-session subagent by default", async () => {
       const parentPane = process.env.HERDR_PANE_ID!;
       const parentTab = getSurfaceTab(parentPane);
       assert.ok(parentTab, "expected to read the parent pane's tab");
 
-      const top = createTrackedSurface(env, "tab-top-level");
-      const topTab = getSurfaceTab(top);
-      assert.ok(topTab, "expected to read the new surface's tab");
-      assert.notEqual(topTab, parentTab, "a main-session subagent must get its own tab");
-
-      // A subagent spawning its own child is marked by PI_SUBAGENT_NAME and
-      // splits its own pane, so a lineage stays in one tab.
       const savedName = process.env.PI_SUBAGENT_NAME;
-      const savedPane = process.env.HERDR_PANE_ID;
       try {
-        process.env.PI_SUBAGENT_NAME = "tab-top-level";
+        delete process.env.PI_SUBAGENT_NAME;
+        const top = createTrackedSurface(env, "pane-top-level");
+        assert.equal(
+          getSurfaceTab(top),
+          parentTab,
+          "the Pi-Bolt default puts a main-session subagent in the parent tab",
+        );
+
+        // A subagent spawning its own child is marked by PI_SUBAGENT_NAME and
+        // splits its own pane, so a lineage stays in one tab.
+        process.env.PI_SUBAGENT_NAME = "pane-top-level";
         process.env.HERDR_PANE_ID = top;
-        const nested = createTrackedSurface(env, "tab-nested-child");
-        assert.equal(getSurfaceTab(nested), topTab, "a nested subagent must stay in its parent's tab");
+        const nested = createTrackedSurface(env, "pane-nested-child");
+        assert.equal(
+          getSurfaceTab(nested),
+          parentTab,
+          "a nested subagent must stay in its parent's tab",
+        );
       } finally {
         if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME;
         else process.env.PI_SUBAGENT_NAME = savedName;
-        process.env.HERDR_PANE_ID = savedPane;
+        process.env.HERDR_PANE_ID = parentPane;
+      }
+    });
+
+    it("opens a tab for a main-session subagent when PI_SUBAGENT_TOP_LEVEL_SURFACE=tab", async () => {
+      const parentPane = process.env.HERDR_PANE_ID!;
+      const parentTab = getSurfaceTab(parentPane);
+      assert.ok(parentTab, "expected to read the parent pane's tab");
+
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      const savedSurface = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      try {
+        delete process.env.PI_SUBAGENT_NAME;
+        process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "tab";
+        const top = createTrackedSurface(env, "tab-top-level");
+        const topTab = getSurfaceTab(top);
+        assert.ok(topTab, "expected to read the new surface's tab");
+        assert.notEqual(topTab, parentTab, "the tab override gives the subagent its own tab");
+
+        process.env.PI_SUBAGENT_NAME = "tab-top-level";
+        process.env.HERDR_PANE_ID = top;
+        const nested = createTrackedSurface(env, "tab-nested-child");
+        assert.equal(
+          getSurfaceTab(nested),
+          topTab,
+          "a nested subagent must stay in its parent's tab",
+        );
+      } finally {
+        if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME;
+        else process.env.PI_SUBAGENT_NAME = savedName;
+        if (savedSurface === undefined) delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+        else process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedSurface;
+        process.env.HERDR_PANE_ID = parentPane;
       }
     });
 

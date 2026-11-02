@@ -104,6 +104,11 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   discoverable agents and silently empty agent defaults.
 - `/subagent-doctor` — prints each agent's allowlist, resolved extension paths,
   provider-extension status, and Herdr availability without a model call.
+- Layout defaults — the Pi-Bolt fork defaults a top-level subagent to a split
+  `pane` and the split direction to `right`, matching the previously installed
+  extension. Upstream defaults were `tab` and `auto`. Both remain overridable
+  with `PI_SUBAGENT_TOP_LEVEL_SURFACE` and `PI_SUBAGENT_SPLIT_DIRECTION`.
+  The Herdr desktop app still chooses the split side itself.
 
 ## Behavior changes to review
 
@@ -139,7 +144,7 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 234 tests, 234 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 240 tests, 240 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
   works if `PI_SUBAGENT_ALLOWED` is unset.
@@ -172,6 +177,10 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   `shellPath`, the explicit `PI_SHELL_PATH` refusal when no candidate exists,
   and `isHerdrDesktopAvailable()` honouring an existing/missing
   `PI_SUBAGENT_HC_BIN` path.
+- Layout tests cover the Pi-Bolt default (`pane` for a top-level subagent,
+  `right` split) with the env vars unset, plus the `tab`, `auto`, `down`, and
+  `right` overrides. The Herdr surface integration test now checks the pane
+  default and the tab override separately.
 - Bundled `researcher` and `worker` now request `fetch_content` instead of the
   removed `web_fetch`; with the new hard failure, `web_fetch` made both agents
   impossible to spawn on a clean install. The README agent table was corrected

@@ -201,9 +201,12 @@ function bashPosixDir(dir: string): string | null {
  * Where a new subagent pane goes, relative to the parent pi pane.
  * "right" and "down" always split that way. "auto" follows the Herdr
  * guidance: split a wide pane to the right and a narrow or tall pane down.
- * Override with PI_SUBAGENT_SPLIT_DIRECTION.
+ *
+ * The Pi-Bolt fork defaults to "right" to match the previously installed
+ * extension (the upstream default is "auto"). Override with
+ * PI_SUBAGENT_SPLIT_DIRECTION.
  */
-const SUBAGENT_SPLIT_DIRECTION: "right" | "down" | "auto" = "auto";
+const SUBAGENT_SPLIT_DIRECTION: "right" | "down" | "auto" = "right";
 
 function splitDirectionSetting(): "right" | "down" | "auto" {
   const raw = process.env.PI_SUBAGENT_SPLIT_DIRECTION?.trim();
@@ -213,11 +216,14 @@ function splitDirectionSetting(): "right" | "down" | "auto" {
 /**
  * Which surface a top-level subagent gets. "tab" gives every subagent of the
  * main session its own tab, so the tab bar reads as a list of running
- * subagents and each lineage keeps its own pane layout. "pane" keeps the old
- * behaviour of splitting the main session's pane.
- * Override with PI_SUBAGENT_TOP_LEVEL_SURFACE.
+ * subagents and each lineage keeps its own pane layout. "pane" splits the
+ * main session's pane.
+ *
+ * The Pi-Bolt fork defaults to "pane" to match the previously installed
+ * extension (the upstream default is "tab"). Override with
+ * PI_SUBAGENT_TOP_LEVEL_SURFACE.
  */
-const SUBAGENT_TOP_LEVEL_SURFACE: "tab" | "pane" = "tab";
+const SUBAGENT_TOP_LEVEL_SURFACE: "tab" | "pane" = "pane";
 
 function topLevelSurfaceSetting(): "tab" | "pane" {
   const raw = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE?.trim();

@@ -16,10 +16,10 @@ Add `-l` to install for the current project only (`.pi/settings.json`). Update l
 
 `subagent()` returns immediately. The sub-agent runs in its own Herdr surface, created with `--no-focus` so it never steals keyboard focus:
 
-- **Spawned by the main session** — a new tab, labelled with the sub-agent's name. One tab per sub-agent keeps the tab bar readable as a list of what is running.
+- **Spawned by the main session** — a split pane to the right of the main session's pane by default, labelled with the sub-agent's name. Set `PI_SUBAGENT_TOP_LEVEL_SURFACE=tab` for one tab per sub-agent instead.
 - **Spawned by another sub-agent** — a split off the parent's pane (`$HERDR_PANE_ID`), so a whole lineage stays inside one tab.
 
-The pane carries the same name in the Herdr sidebar. Set `PI_SUBAGENT_TOP_LEVEL_SURFACE=pane` to put top-level sub-agents in split panes instead of tabs (the default constant is `SUBAGENT_TOP_LEVEL_SURFACE` in `pi-extension/subagents/herdr.ts`). A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+The pane carries the same name in the Herdr sidebar. `PI_SUBAGENT_TOP_LEVEL_SURFACE=tab` gives top-level sub-agents their own tabs; the default constant is `SUBAGENT_TOP_LEVEL_SURFACE` in `pi-extension/subagents/herdr.ts`. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -30,7 +30,7 @@ The pane carries the same name in the Herdr sidebar. Set `PI_SUBAGENT_TOP_LEVEL_
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Split direction follows the Herdr geometry rule: a wide parent pane splits right, a narrow or tall one splits down. Force one direction with `PI_SUBAGENT_SPLIT_DIRECTION=right|down|auto` (the default constant is `SUBAGENT_SPLIT_DIRECTION` in `pi-extension/subagents/herdr.ts`).
+Split direction defaults to the right of the parent pane, matching the previously installed extension. Set `PI_SUBAGENT_SPLIT_DIRECTION=down` to force a downward split, or `auto` for the Herdr geometry rule (a wide parent pane splits right, a narrow or tall one splits down); the default constant is `SUBAGENT_SPLIT_DIRECTION` in `pi-extension/subagents/herdr.ts`.
 
 Panes are kept evenly sized: after every spawn and exit (debounced) the extension reads `herdr pane layout` and issues `herdr pane resize` calls so each column and row gets an equal share. Herdr has no named layouts, so this is the equivalent of tmux's `even-horizontal`.
 

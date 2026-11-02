@@ -2893,9 +2893,47 @@ describe("herdr.ts layout", () => {
       assert.equal(chooseSplitDirection(undefined, "w1:p1", "auto"), "right");
       assert.equal(chooseSplitDirection(lopsided, "w1:p99", "auto"), "right");
     });
+
+    it("defaults to right (Pi-Bolt) and keeps PI_SUBAGENT_SPLIT_DIRECTION overrides", () => {
+      const saved = process.env.PI_SUBAGENT_SPLIT_DIRECTION;
+      try {
+        delete process.env.PI_SUBAGENT_SPLIT_DIRECTION;
+        // This pane is 60x40; auto would pick down.
+        assert.equal(chooseSplitDirection(lopsided, "w1:p2"), "right");
+
+        process.env.PI_SUBAGENT_SPLIT_DIRECTION = "auto";
+        assert.equal(chooseSplitDirection(lopsided, "w1:p2"), "down");
+
+        process.env.PI_SUBAGENT_SPLIT_DIRECTION = "down";
+        assert.equal(chooseSplitDirection(lopsided, "w1:p1"), "down");
+
+        process.env.PI_SUBAGENT_SPLIT_DIRECTION = "right";
+        assert.equal(chooseSplitDirection(lopsided, "w1:p1"), "right");
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_SPLIT_DIRECTION", saved);
+      }
+    });
   });
 
   describe("chooseSurfaceKind", () => {
+    it("defaults to a pane (Pi-Bolt) and keeps PI_SUBAGENT_TOP_LEVEL_SURFACE=tab as an override", () => {
+      const saved = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      try {
+        delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+        delete process.env.PI_SUBAGENT_NAME;
+        assert.equal(chooseSurfaceKind(false), "pane");
+        assert.equal(chooseSurfaceKind(true), "pane");
+
+        process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "tab";
+        assert.equal(chooseSurfaceKind(false), "tab");
+        assert.equal(chooseSurfaceKind(true), "pane");
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_TOP_LEVEL_SURFACE", saved);
+        restoreEnvVar("PI_SUBAGENT_NAME", savedName);
+      }
+    });
+
     it("gives a main-session subagent its own tab and keeps a nested subagent's children in its tab", () => {
       assert.equal(chooseSurfaceKind(false, "tab"), "tab");
       assert.equal(chooseSurfaceKind(true, "tab"), "pane");
