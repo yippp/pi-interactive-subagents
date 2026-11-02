@@ -29,6 +29,7 @@ import {
 } from "./herdr.ts";
 
 import {
+  countSessionEntryLines,
   findLastAssistantMessage,
   getNewEntries,
   getSessionId,
@@ -246,6 +247,14 @@ function providerExtensionPath(providerPrefix: string): string | undefined {
   return join(getAgentConfigDir(), "npm", "node_modules", ...segments);
 }
 
+/** Resolve installed provider extensions for a model id or provider prefix. */
+function providerExtensionsForModel(model: string | null | undefined): string[] {
+  if (!model) return [];
+  const prefix = model.split("/")[0];
+  const path = prefix ? providerExtensionPath(prefix) : undefined;
+  return path && existsSync(path) ? [path] : [];
+}
+
 /** Registered provider extension paths, for diagnostics and tests. */
 function providerExtensionMap(): Record<string, string> {
   const map: Record<string, string> = {};
@@ -316,7 +325,7 @@ function getToolExtensionPath(tool: string): string | undefined {
   // Resolve the actual loaded extension (npm package, git package, local file)
   // through pi's canonical provenance instead of guessing install paths. This
   // is what makes npm-provided tools such as pi-web-access work in a child.
-  const source = latestPi?.getAllTools().find((item) => item.name === tool)?.sourceInfo;
+  const source = latestPi?.getAllTools?.().find((item) => item.name === tool)?.sourceInfo;
   if (
     source &&
     source.source !== "builtin" &&
@@ -1054,15 +1063,6 @@ function applySandboxToParts(
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
     parts.push("--model", shellEscape(model));
-
-    // Restricted children run with --no-extensions. Load a provider extension
-    // only when discovery is off, so it is never loaded twice.
-    if (loadout.toolAllowlist) {
-      const providerExt = providerExtensionPath(loadout.model.split("/")[0] ?? "");
-      if (providerExt && existsSync(providerExt)) {
-        parts.push("-e", shellEscape(providerExt));
-      }
-    }
   }
 
   if (loadout.identity) {
@@ -1101,6 +1101,15 @@ function applySandboxToParts(
     // keep the upstream behaviour of loading it for `anthropic/` OAuth models.
     const authExtPath = getProviderAuthExtensionPath(loadout.model);
     if (authExtPath) extPaths.add(authExtPath);
+    // Restricted children run with --no-extensions, so a model provider
+    // implemented by an extension must be re-enabled explicitly. Prefer the
+    // spawn-time snapshot: a profile may omit `model:` and use the child's own
+    // default, which cannot be re-derived from the loadout at resume time.
+    const providerExts =
+      loadout.providerExtensions ?? providerExtensionsForModel(loadout.model);
+    for (const providerExt of providerExts) {
+      if (existsSync(providerExt)) extPaths.add(providerExt);
+    }
     for (const extPath of extPaths) {
       parts.push("-e", shellEscape(extPath));
     }
@@ -1412,7 +1421,15 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: Static<typeof SubagentParams> & { name: string },
-  ctx: { sessionManager: { getSessionFile(): string | null | undefined; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: {
+    sessionManager: {
+      getSessionFile(): string | null | undefined;
+      getSessionId(): string;
+      getSessionDir(): string;
+    };
+    cwd: string;
+    model?: { provider: string; id: string };
+  },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -1571,9 +1588,6 @@ async function launchSubagent(
   const parts: string[] = [childPiBin()];
   parts.push("--session", shellEscape(subagentSessionFile));
 
-  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
-
   // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
   // else the propagated global dir. Captured once so the launch env and the
   // resume snapshot agree.
@@ -1589,10 +1603,17 @@ async function launchSubagent(
   // Snapshot the fully-resolved sandbox beside the session file so a later
   // `subagent_message({ name })` resume can replay the exact same
   // restriction instead of relaunching pi with all global extensions + tools.
+  // Provider extensions are resolved here as well: when the profile omits
+  // `model:` the child uses its own default, which resume cannot recover.
+  const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
     toolExtensions,
+    providerExtensions:
+      agentDefs?.cli === "claude"
+        ? undefined
+        : providerExtensionsForModel(effectiveModel ?? parentModel),
     model: effectiveModel ?? null,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
@@ -1942,11 +1963,9 @@ function buildResumeCommand(params: {
 }): { command: string; launchScriptFile: string; resumeMsgFile?: string } {
   const parts = [childPiBin(), "--session", shellEscape(params.sessionPath)];
 
-  // Load subagent-done.ts so the agent can ask questions and self-terminate.
-  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
-
   // Replay the model, identity, and default-deny tool/extension sandbox.
+  // applySandboxToParts adds subagent-done.ts through ask_question, which is
+  // always part of the allowlist.
   applySandboxToParts(parts, params.loadout, {
     artifactDir: params.artifactDir,
     name: params.name,
@@ -2006,6 +2025,7 @@ function buildResumeCommand(params: {
  * supersedes the finished attempt and `subagent_wait` keeps waiting.
  */
 async function retrySubagentRun(opts: {
+  id: string;
   name: string;
   task: string;
   agent?: string;
@@ -2015,15 +2035,17 @@ async function retrySubagentRun(opts: {
   errorMessage: string;
   attempt: number;
   maxAttempts: number;
-}): Promise<{ running: RunningSubagent } | { error: string }> {
+}): Promise<{ running: RunningSubagent; entryCountBefore: number } | { error: string }> {
   const startTime = Date.now();
-  const id = Math.random().toString(16).slice(2, 10);
+  // Reuse the run id. The join is keyed by name, and keeping the same id means
+  // an in-flight subagent_wait keeps waiting instead of returning
+  // "runtime_changed" while the retried child is still running.
+  const id = opts.id;
   const activityFile = getSubagentActivityFile(opts.artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
 
-  const surface = createSurface(opts.name);
-  await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-
+  // Build before creating a surface: a missing pinned extension or identity
+  // write failure must not leave an empty pane behind.
   const { command, launchScriptFile } = buildResumeCommand({
     id,
     name: opts.name,
@@ -2032,10 +2054,17 @@ async function retrySubagentRun(opts: {
     loadout: opts.loadout,
     artifactDir: opts.artifactDir,
     activityFile,
-    // Resume is always autonomous, same as the manual resume path.
+    // A retry must finish on its own; an interactive profile would leave the
+    // pane open waiting for a user after the recovered turn.
     autoExit: resolveResumeLaunchBehavior().autoExit,
     scriptLabel: `retry-${opts.attempt}`,
   });
+
+  // Only the new attempt's output belongs in the result summary.
+  const entryCountBefore = countSessionEntryLines(opts.sessionPath);
+
+  const surface = createSurface(opts.name);
+  await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
   try {
     sendLongCommand(surface, command, {
@@ -2075,7 +2104,7 @@ async function retrySubagentRun(opts: {
   if (latestPi) startStatusRefresh(latestPi);
   updateWidget();
 
-  return { running };
+  return { running, entryCountBefore };
 }
 
 function fallbackExitSummary(result: SubagentResult): string {
@@ -2095,19 +2124,22 @@ async function watchSubagentWithRetry(opts: {
   running: RunningSubagent;
   signal: AbortSignal;
   ctx: { sessionManager: { getSessionId(): string; getSessionDir(): string } };
+  /** Session lines that predate this run; only newer output is summarized. */
+  entryCountBefore: number;
 }): Promise<void> {
   const maxAttempts = SUBAGENT_RETRY_MAX + 1;
   let running = opts.running;
   let signal = opts.signal;
   let attempt = 1;
+  let entryCountBefore = opts.entryCountBefore;
 
   for (;;) {
     let result: SubagentResult;
     try {
       result = await watchSubagent(running, signal);
     } catch (err: any) {
-      if (signal.aborted || getModuleAbortSignal().aborted) return;
       joins.finish(running.id, running.name, true);
+      if (signal.aborted || getModuleAbortSignal().aborted) return;
       updateWidget();
       latestPi?.sendMessage(
         {
@@ -2137,6 +2169,7 @@ async function watchSubagentWithRetry(opts: {
       const loadout = readSubagentLoadout(running.sessionFile);
       if (loadout) {
         const retry = await retrySubagentRun({
+          id: running.id,
           name: running.name,
           task: running.task,
           ...(running.agent ? { agent: running.agent } : {}),
@@ -2150,6 +2183,7 @@ async function watchSubagentWithRetry(opts: {
         if ("running" in retry) {
           running = retry.running;
           signal = running.abortController?.signal ?? new AbortController().signal;
+          entryCountBefore = retry.entryCountBefore;
           attempt += 1;
           continue;
         }
@@ -2165,9 +2199,15 @@ async function watchSubagentWithRetry(opts: {
     joins.finish(running.id, running.name, result.exitCode !== 0);
     updateWidget();
 
-    // watchSubagent already extracted the newest assistant message and the
-    // session/stats metadata from the session file.
-    const summary = result.summary || fallbackExitSummary(result);
+    // Only this attempt's new assistant output belongs in the result. Using
+    // the whole session would report the previous turn (or the failed
+    // attempt) as the outcome of a retry that produced no new output.
+    const summary =
+      running.cli === "claude"
+        ? result.summary || fallbackExitSummary(result)
+        : (findLastAssistantMessage(
+            getNewEntries(running.sessionFile, entryCountBefore),
+          ) ?? fallbackExitSummary(result));
     const presentation = resolveResultPresentation(
       { ...result, summary, sessionFile: running.sessionFile },
       running.name,
@@ -2468,6 +2508,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           running,
           signal: watcherAbort.signal,
           ctx,
+          entryCountBefore: 0,
         });
 
         // Return immediately
@@ -2752,17 +2793,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
 
-        // Fail before the pane opens, including legacy unrestricted snapshots
-        // that have no tool list to replay safely.
+        // Validate and build the command before creating a surface, including
+        // legacy unrestricted snapshots that have no tool list to replay.
         resolveToolExtensions(loadout.toolAllowlist, loadout.toolExtensions);
+        const entryCountBefore = countSessionEntryLines(sessionPath);
 
         // Command construction is shared with provider-error retries.
         const { command, launchScriptFile, resumeMsgFile } = buildResumeCommand({
@@ -2776,16 +2815,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           autoExit,
           scriptLabel: "resume",
         });
-        sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
+
+        const surface = createSurface(name);
+        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        try {
+          sendLongCommand(surface, command, {
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${name}`,
+              `# Generated: ${new Date().toISOString()}`,
+              `# Session: ${sessionPath}`,
+              `# Surface: ${surface}`,
+              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ].join("\n"),
+          });
+        } catch (error: any) {
+          try {
+            closeSurface(surface);
+          } catch {}
+          const err = `Failed to start the resumed session: ${error?.message ?? String(error)}`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
@@ -2817,6 +2867,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           running,
           signal: watcherAbort.signal,
           ctx,
+          entryCountBefore,
         });
 
         return {

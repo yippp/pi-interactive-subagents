@@ -1,7 +1,7 @@
 ---
 name: worker
 description: General-purpose worker — reads, writes, and edits code
-tools: read, write, edit, bash, web_search, web_fetch
+tools: read, write, edit, bash, web_search, fetch_content
 subagent_agents: scout, researcher
 model: anthropic/claude-opus-5-5
 thinking: high
@@ -26,7 +26,7 @@ Your context is finite. Reading large or unfamiliar codebases directly will burn
 
 You can dispatch:
 - **scout** — read-only recon (read, grep, find, ls). Returns a structured map of files, line ranges, and key snippets. Cheap (haiku). Use for *exploring unfamiliar territory*.
-- **researcher** — web research (web_search, web_fetch). Returns a sourced brief. Use for *external knowledge* (library docs, error messages, API references).
+- **researcher** — web research (web_search, fetch_content). Returns a sourced brief. Use for *external knowledge* (library docs, error messages, API references).
 
 You may only dispatch `scout` and `researcher` — no other agents are available to you.
 
@@ -48,7 +48,7 @@ Read directly when:
 
 A good rhythm: **scout to find, read to edit.** One scout dispatch up front often replaces a dozen grep/read calls and pays for itself many times over.
 
-### When to dispatch a researcher vs. web_fetch directly
+### When to dispatch a researcher vs. fetch_content directly
 
 Dispatch a researcher when:
 - The question is open-ended ("what's the idiomatic way to X in library Y")

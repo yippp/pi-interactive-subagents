@@ -105,6 +105,12 @@ export interface SubagentLoadout {
    * granted tool.
    */
   toolExtensions?: Record<string, string>;
+  /**
+   * Provider extension entry paths resolved at spawn time. Stored because a
+   * profile may omit `model:` and thus use the host's default model: resume
+   * and retry cannot re-derive that provider from the snapshot alone.
+   */
+  providerExtensions?: string[];
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */

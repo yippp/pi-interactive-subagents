@@ -230,6 +230,74 @@ it("provider extension is loaded for a restricted child, and the Anthropic auth 
   });
 });
 
+it("bundled agents resolve their declared tools with npm provenance", () => {
+  const previousCwd = process.cwd();
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const dir = tempDir("pi-bundled-agents-");
+  try {
+    process.chdir(dir);
+    process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
+    const entry = join(dir, "pi-web-access dist index.ts");
+    writeFileSync(entry, "export default () => {};");
+    mockExtension([
+      sourceTool("web_search", entry),
+      sourceTool("fetch_content", entry),
+    ]);
+    for (const name of ["scout", "researcher", "worker"]) {
+      const definition = api.loadAgentDefaults(name);
+      assert.ok(definition, `bundled ${name} must be discoverable`);
+      const allow = api.buildSubagentToolAllowlist(definition.tools, {
+        grantSpawning: !!definition.subagentAgents?.length,
+      });
+      assert.doesNotThrow(
+        () => api.resolveToolExtensions(allow),
+        `${name} tools must resolve after the web_fetch -> fetch_content change: ${allow}`,
+      );
+    }
+  } finally {
+    process.chdir(previousCwd);
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("provider extension snapshot covers a profile that omits model:", async () => {
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  await withTempDir("pi-provider-null-model-", (dir) => {
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const providerEntry = join(
+      dir,
+      "npm",
+      "node_modules",
+      "pi-antigravity-acp-provider",
+      "extensions",
+      "index.ts",
+    );
+    mkdirSync(dirname(providerEntry), { recursive: true });
+    writeFileSync(providerEntry, "export default () => {};");
+
+    const parts: string[] = [];
+    api.applySandboxToParts(
+      parts,
+      loadout({ model: null, providerExtensions: [providerEntry] }),
+      { artifactDir: dir, name: "x" },
+    );
+    assert.ok(parts.some((part) => part.includes(providerEntry)));
+
+    // Without a snapshot, a null model cannot name a provider: nothing is added.
+    const unsnapshotted: string[] = [];
+    api.applySandboxToParts(unsnapshotted, loadout({ model: null }), {
+      artifactDir: dir,
+      name: "x",
+    });
+    assert.ok(!unsnapshotted.some((part) => part.includes(providerEntry)));
+  }).finally(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  });
+});
+
 it("Windows absolute cwd is not joined onto the current directory", () => {
   const windowsPath = "G:\\repo\\nested";
   const resolved = api.resolveSubagentPaths({ agent: "scout", task: "t", cwd: windowsPath }, null);
@@ -283,6 +351,11 @@ it("retry defaults, nudge, and the shared resume command", async () => {
     assert.ok(resumeMsgFile && command.includes(`@${resumeMsgFile}`));
     assert.ok(launchScriptFile.includes(join("subagent-scripts", "recon-worker-retry-1-")));
     assert.ok(existsSync(resumeMsgFile!));
+    assert.equal(
+      command.split("subagent-done.ts").length - 1,
+      1,
+      "subagent-done.ts must be loaded once, via ask_question",
+    );
   });
 });
 

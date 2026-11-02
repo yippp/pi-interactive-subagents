@@ -48,7 +48,10 @@ export class SubagentJoin {
     if (!selected.length) throw new Error("Specify at least one subagent name returned by subagent().");
     const targets = selected.map(name => {
       const run = this.runs.get(name);
-      if (!run) throw new Error(`Unknown subagent "${name}" in this runtime. After /reload, spawn a fresh run or resume it by name first.`);
+      if (!run) {
+        const known = [...this.runs.keys()].join(", ") || "(none)";
+        throw new Error(`Unknown subagent "${name}" in this runtime (known: ${known}). After /reload, spawn a fresh run or resume it by name first.`);
+      }
       return { ...run };
     });
     return new Promise<{ reason: string; runs: RunState[]; questions: RunState[] }>((resolve, reject) => {

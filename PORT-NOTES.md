@@ -25,7 +25,14 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   `retryNudge`, `SUBAGENT_RETRY_MAX` (default 3 extra attempts,
   `PI_SUBAGENT_RETRY_MAX=0` disables). Only `result.errorMessage` triggers a
   retry; claude children keep their previous behavior. A retry resumes the same
-  session in a fresh surface and re-arms the name-keyed join.
+  session in a fresh surface under the **same run id**, so an in-flight
+  `subagent_wait` keeps waiting instead of returning `runtime_changed`.
+  Summaries use only entries written after the attempt started, so a retry
+  that produces no new assistant output cannot report the previous answer.
+- Provider-extension snapshot — `SubagentLoadout.providerExtensions` records
+  the provider extension resolved at spawn time. This covers profiles that
+  omit `model:` and therefore use the child's own default, which resume cannot
+  re-derive. The upstream Anthropic OAuth transport logic is kept separately.
 - Tool source mapping — `getToolExtensionPath` now resolves `sourceInfo.path`
   from `getAllTools()` for npm/git/local extensions instead of guessing
   `<agent dir>/extensions/<name>/index.ts`. This is what makes
@@ -63,20 +70,29 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   finished agent by name or spawn fresh before waiting.
 - A tool that cannot be resolved is a hard spawn error. A new agent profile
   using an extension-provided tool needs that extension loaded in the parent
-  (or `registerToolExtension`), otherwise spawn fails loudly.
+  (or `registerToolExtension`), otherwise spawn fails loudly. Local profiles
+  that still request `web_fetch` must switch to pi-web-access's
+  `fetch_content`; the bundled agents and README were updated.
 
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 194 tests, 194 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 196 tests, 196 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
   works if `PI_SUBAGENT_ALLOWED` is unset.
 - Added tests: `test/join.test.ts` (all/any, timeout, abort, question, blocked,
   stale generation, reset) and `test/pi-bolt.test.ts` (read-only default,
-  legacy snapshot refusal, provenance for pi-web-access tool names, pinned
-  paths, provider and Anthropic extensions, Windows cwd, Pi-Bolt binary
-  resolution, shared resume command, wait tool statuses and question release).
+  legacy snapshot refusal, provenance for pi-web-access tool names, bundled
+  agent tool resolution, pinned paths, provider and Anthropic extensions,
+  provider snapshot for a null model, Windows cwd, Pi-Bolt binary resolution,
+  shared resume command, wait tool statuses and question release).
+- Bundled `researcher` and `worker` now request `fetch_content` instead of the
+  removed `web_fetch`; with the new hard failure, `web_fetch` made both agents
+  impossible to spawn on a clean install. The README agent table was corrected
+  to the actual models and tools.
+- Resume validates the loadout and builds the command before creating a
+  surface, and closes the surface if the launch write fails.
 - Updated upstream tests for the intentional behavior changes and for Windows
   path separators.
 
@@ -95,12 +111,15 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 4. The provider extension path was tested with a temporary fixture matching the
    real npm layout, not with a live `antigravity-acp/*` model call.
 5. The retry loop was not exercised against a reproducible provider failure.
-   `retryNudge`, `buildResumeCommand`, defaults, and join re-arm semantics are
-   covered, but no child was actually resumed after an upstream error.
+   `retryNudge`, `buildResumeCommand`, defaults, summary baselines, and the
+   same-id join behavior are covered, but no child was actually resumed after
+   an upstream error.
 6. A native blocked-UI signal is not wired into joins. The join class supports
    `blocked`, but this upstream has no poll event for Herdr `agent_blocked`
    (it only surfaces as a steer error). `ask_question` early return is wired
-   through the `.ask` file and is tested.
+   through the `.ask` file and is tested. Any child question releases a wait,
+   including one for unrelated names, by design: a queued steer cannot be
+   answered while a tool call is blocked.
 7. `npm run test:integration` was not run: it starts live pi sessions and model
    requests in Herdr surfaces.
 8. The Windows cwd fix is covered by a unit test on win32, not by a live spawn

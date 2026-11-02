@@ -129,9 +129,9 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **scout** | `anthropic/claude-haiku-4-5` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **researcher** | `anthropic/claude-opus-5-5` | `web_search`, `fetch_content`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | `anthropic/claude-opus-5-5` | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
