@@ -529,6 +529,96 @@ function resolveEffectiveSessionMode(
   return agentDefs?.sessionMode ?? "standalone";
 }
 
+function readJsonSettings(path: string): any | null {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** The last model_change in a pi session file, or null. */
+function lastModelInSession(file: string): string | null {
+  try {
+    const lines = readFileSync(file, "utf8").split("\n").filter((line) => line.trim());
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (
+          entry?.type === "model_change" &&
+          typeof entry.provider === "string" &&
+          entry.provider.trim() &&
+          typeof entry.modelId === "string" &&
+          entry.modelId.trim()
+        ) {
+          return `${entry.provider.trim()}/${entry.modelId.trim()}`;
+        }
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Resolve the model the child actually starts with when the profile omits
+ * `model:`.
+ *
+ * The parent's current model is not authoritative: a child resolves its own
+ * global/project settings, `enabledModels` scoping changes the choice, and a
+ * fork inherits the parent session's last model_change. Snapshotting the wrong
+ * provider would load the wrong provider/auth extension, so refuse when the
+ * effective model cannot be determined reliably.
+ */
+function resolveChildInitialModel(opts: {
+  explicitModel: string | null;
+  sessionMode: SubagentSessionMode;
+  parentSessionFile: string;
+  agentDir: string;
+  childCwd: string;
+}): { model: string } | { error: string } {
+  if (opts.explicitModel) return { model: opts.explicitModel };
+
+  if (opts.sessionMode === "fork") {
+    const inherited = lastModelInSession(opts.parentSessionFile);
+    if (inherited) return { model: inherited };
+    return {
+      error: `the forked session has no recorded model; set model: explicitly.`,
+    };
+  }
+
+  const globalFile = join(opts.agentDir, "settings.json");
+  const projectFile = join(opts.childCwd, ".pi", "settings.json");
+  const globalSettings = readJsonSettings(globalFile) ?? {};
+  const projectSettings = readJsonSettings(projectFile) ?? {};
+  const settings = { ...globalSettings, ...projectSettings };
+
+  const scoped = settings.enabledModels;
+  if (Array.isArray(scoped) && scoped.length > 0) {
+    return {
+      error:
+        `enabledModels scopes model selection (${scoped.join(", ")}), so the effective default ` +
+        `model cannot be resolved reliably; set model: explicitly.`,
+    };
+  }
+
+  if (
+    typeof settings.defaultProvider === "string" &&
+    settings.defaultProvider.trim() &&
+    typeof settings.defaultModel === "string" &&
+    settings.defaultModel.trim()
+  ) {
+    return {
+      model: `${settings.defaultProvider.trim()}/${settings.defaultModel.trim()}`,
+    };
+  }
+
+  return {
+    error:
+      `neither ${globalFile} nor ${projectFile} has defaultProvider/defaultModel; ` +
+      `set model: explicitly.`,
+  };
+}
+
 function resolveLaunchBehavior(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
@@ -1033,11 +1123,12 @@ function resolveToolExtensions(
     const path = pinned?.[tool] ?? getToolExtensionPath(tool);
     if (!path || !isAbsolute(path) || !existsSync(path)) {
       // `builtin:mcp` is a gateway, not a per-tool extension. Loading it with
-      // -e would connect every configured MCP server and expose its tools to
-      // the child, which is broader than the grant. Keep refusing it.
+      // -e connects every enabled MCP server and may expose their names and
+      // capabilities to the child; fine-grained per-tool isolation is not
+      // verified. Keep refusing it.
       if (tool.startsWith("mcp__") || tool.startsWith("mcp_")) {
         throw new Error(
-          `MCP tool "${tool}" cannot be granted to a restricted subagent: loading builtin:mcp would expose every configured MCP server, not just this tool. Remove MCP tools from the profile's tools list, or expose this tool through a dedicated extension and registerToolExtension(name, path).`,
+          `MCP tool "${tool}" cannot be granted to a restricted subagent: loading builtin:mcp connects every enabled MCP server and may expose their names/capabilities, and per-tool isolation is not verified. Remove MCP tools from the profile's tools list, or expose this tool through a dedicated extension and registerToolExtension(name, path).`,
         );
       }
       throw new Error(
@@ -1071,6 +1162,18 @@ function applySandboxToParts(
     loadout.toolAllowlist,
     loadout.toolExtensions,
   );
+
+  // A null model means the child would resolve its own default, which cannot be
+  // recovered from the snapshot. Refuse instead of replaying the wrong provider.
+  if (
+    !loadout.model &&
+    loadout.providerExtensions === undefined &&
+    loadout.providerAuthExtension === undefined
+  ) {
+    throw new Error(
+      "Cannot safely replay a subagent without a recorded model or provider snapshot. Spawn a fresh subagent with an explicit model.",
+    );
+  }
 
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
@@ -1436,6 +1539,8 @@ export const __test__ = {
   SUBAGENT_RETRY_MAX,
   resolveSubagentPaths,
   resolveChildPiBin,
+  resolveChildInitialModel,
+  lastModelInSession,
   watchSubagentWithRetry,
   summarizeAttempt,
 };
@@ -1464,7 +1569,6 @@ async function launchSubagent(
       getSessionDir(): string;
     };
     cwd: string;
-    model?: { provider: string; id: string };
   },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
@@ -1472,7 +1576,6 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
   const grantSpawning = !!agentDefs?.subagentAgents?.length;
   // Every profile resolves to an explicit allowlist (read-only if it omitted
@@ -1493,6 +1596,27 @@ async function launchSubagent(
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
+  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+  // Resolve the real child model before any surface exists. An omitted model
+  // means the child reads its own settings, not the parent's current ctx.model.
+  let effectiveModel = params.model ?? agentDefs?.model ?? null;
+  if (!effectiveModel && agentDefs?.cli !== "claude") {
+    const resolved = resolveChildInitialModel({
+      explicitModel: null,
+      sessionMode: launchBehavior.sessionMode,
+      parentSessionFile: sessionFile,
+      agentDir: localAgentDir && existsSync(localAgentDir) ? localAgentDir : process.env.PI_CODING_AGENT_DIR ?? getAgentConfigDir(),
+      childCwd: targetCwdForSession,
+    });
+    if ("error" in resolved) {
+      throw new Error(`Cannot start subagent "${params.name || params.agent}": ${resolved.error}`);
+    }
+    effectiveModel = resolved.model;
+  }
+  const resolvedAgentDir =
+    localAgentDir && existsSync(localAgentDir)
+      ? localAgentDir
+      : process.env.PI_CODING_AGENT_DIR ?? null;
 
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
@@ -1513,8 +1637,6 @@ async function launchSubagent(
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
-
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -1627,10 +1749,7 @@ async function launchSubagent(
   // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
   // else the propagated global dir. Captured once so the launch env and the
   // resume snapshot agree.
-  const resolvedAgentDir =
-    localAgentDir && existsSync(localAgentDir)
-      ? localAgentDir
-      : process.env.PI_CODING_AGENT_DIR ?? null;
+  // (resolvedAgentDir was computed before surface creation for model resolution.)
 
   // Default-deny model: every new profile has an explicit allowlist, including
   // profiles that omit `tools:` (read-only fallback). It never inherits all
@@ -1639,9 +1758,8 @@ async function launchSubagent(
   // Snapshot the fully-resolved sandbox beside the session file so a later
   // `subagent_message({ name })` resume can replay the exact same
   // restriction instead of relaunching pi with all global extensions + tools.
-  // Provider extensions are resolved here as well: when the profile omits
-  // `model:` the child uses its own default, which resume cannot recover.
-  const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
+  // The model is resolved above and pinned, so the provider/auth snapshot
+  // cannot drift when the parent switches models.
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
@@ -1649,12 +1767,12 @@ async function launchSubagent(
     providerExtensions:
       agentDefs?.cli === "claude"
         ? undefined
-        : providerExtensionsForModel(effectiveModel ?? parentModel),
+        : providerExtensionsForModel(effectiveModel),
     providerAuthExtension:
       agentDefs?.cli === "claude"
         ? undefined
-        : getProviderAuthExtensionPath(effectiveModel ?? parentModel),
-    model: effectiveModel ?? null,
+        : getProviderAuthExtensionPath(effectiveModel),
+    model: effectiveModel,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,

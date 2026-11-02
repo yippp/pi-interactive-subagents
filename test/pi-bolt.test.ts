@@ -148,6 +148,7 @@ it("snapshot tool extension paths survive the loadout sidecar round-trip", async
     const sessionFile = join(dir, "session.jsonl");
     writeFileSync(sessionFile, "");
     const snapshot = loadout({
+      model: "deepseek/deepseek-flash",
       toolAllowlist: "read,ask_question,fetch_content",
       toolExtensions: { fetch_content: entry },
     });
@@ -285,12 +286,22 @@ it("provider extension snapshot covers a profile that omits model:", async () =>
     );
     assert.ok(parts.some((part) => part.includes(providerEntry)));
 
-    // Without a snapshot, a null model cannot name a provider: nothing is added.
+    // A null-model snapshot without any provider record is refused: the
+    // effective provider cannot be recovered.
+    assert.throws(
+      () => api.applySandboxToParts([], loadout({ model: null }), {
+        artifactDir: dir,
+        name: "x",
+      }),
+      /without a recorded model or provider snapshot/,
+    );
+    // A resolved snapshot that recorded "no provider extension" adds none.
     const unsnapshotted: string[] = [];
-    api.applySandboxToParts(unsnapshotted, loadout({ model: null }), {
-      artifactDir: dir,
-      name: "x",
-    });
+    api.applySandboxToParts(
+      unsnapshotted,
+      loadout({ model: null, providerExtensions: [], providerAuthExtension: null }),
+      { artifactDir: dir, name: "x" },
+    );
     assert.ok(!unsnapshotted.some((part) => part.includes(providerEntry)));
   }).finally(() => {
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -335,7 +346,7 @@ it("retry defaults, nudge, and the shared resume command", async () => {
       name: "Recon Worker",
       sessionPath,
       message: "Please continue",
-      loadout: loadout({ cwd: dir, agentDir: dir, spawnable: ["scout"] }),
+      loadout: loadout({ model: "deepseek/deepseek-flash", cwd: dir, agentDir: dir, spawnable: ["scout"] }),
       artifactDir: dir,
       activityFile: join(dir, "activity.json"),
       autoExit: true,

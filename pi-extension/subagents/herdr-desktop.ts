@@ -26,10 +26,12 @@
 import { execFile, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
+import { resolveBash } from "./shell.ts";
 
 const execFileAsync = promisify(execFile);
 
-function hcBin(): string {
+/** The `hc` CLI, overridable for tests or a non-PATH install. */
+export function hcBin(): string {
   return process.env.PI_SUBAGENT_HC_BIN || "hc";
 }
 
@@ -182,10 +184,20 @@ export function createDesktopSurface(title: string, kind: "tab" | "pane"): strin
  */
 export function launchArgv(
   scriptPath: string,
-  options: { shell?: string; platform?: NodeJS.Platform } = {},
+  options: {
+    shell?: string;
+    platform?: NodeJS.Platform;
+    /** Explicit Bash path, for tests; defaults to the shared resolver. */
+    bash?: string;
+  } = {},
 ): string[] {
   const platform = options.platform ?? process.platform;
-  if (platform === "win32") return ["bash", scriptPath];
+  if (platform === "win32") {
+    // herdr-core starts this argv itself, so a bare `bash` is resolved against
+    // the Windows registry PATH, which often has no Git bin directory. Use the
+    // same absolute Git Bash as the TUI path, never the WSL stub from PATH.
+    return [options.bash?.trim() || resolveBash(platform), scriptPath];
+  }
   const shell = options.shell?.trim() || "/bin/sh";
   return [shell, "-l", "-i", "-c", `exec bash ${quote(scriptPath)}`];
 }

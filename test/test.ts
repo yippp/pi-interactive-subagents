@@ -57,7 +57,8 @@ import {
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import safeBashExtension from "../pi-extension/subagents/tools/safe-bash.ts";
-import { __pollForExitTest__, __layoutTest__ } from "../pi-extension/subagents/herdr.ts";
+import { __pollForExitTest__, __layoutTest__, isHerdrDesktopAvailable } from "../pi-extension/subagents/herdr.ts";
+import { resolveBashFor } from "../pi-extension/subagents/shell.ts";
 import {
   exitStateOf,
   freshTabId,
@@ -2984,7 +2985,82 @@ describe("herdr-desktop.ts", () => {
       ["/bin/zsh", "-l", "-i", "-c", "exec bash '/tmp/it'\\''s.sh'"],
     );
     assert.equal(launchArgv("/s.sh", { platform: "linux" })[0], "/bin/sh", "no $SHELL falls back to sh");
-    assert.deepEqual(launchArgv("C:\\s.sh", { platform: "win32" }), ["bash", "C:\\s.sh"]);
+    const win = launchArgv("C:\\s.sh", { platform: "win32" });
+    assert.equal(win[1], "C:\\s.sh");
+    assert.ok(
+      win[0] === "bash" || /bash(?:\.exe)?$/i.test(win[0]),
+      "Windows uses an absolute Git Bash when one is installed",
+    );
+  });
+
+  it("passes absolute Git Bash, script, and cwd paths with spaces as separate hc argv/args", () => {
+    const bash = "C:\\Program Files\\Git\\bin\\bash.exe";
+    const script = "C:\\Users\\A B\\repo with space\\.pi\\artifacts\\subagent scripts\\run me.sh";
+    const cwd = "C:\\Users\\A B\\repo with space";
+    assert.deepEqual(launchArgv(script, { platform: "win32", bash }), [bash, script]);
+
+    const args = runArgs({
+      cwd,
+      space: "sp 1",
+      tab: "tb1",
+      name: "scout",
+      argv: launchArgv(script, { platform: "win32", bash }),
+    });
+    assert.equal(args[args.indexOf("--cwd") + 1], cwd);
+    assert.deepEqual(args.slice(-2), [bash, script]);
+    assert.ok(!args.some((arg) => arg.startsWith("'")), "hc argv must not be shell-quoted");
+  });
+
+  it("resolveBashFor prefers the configured shell and Git Bash over a bare PATH bash", () => {
+    const exists = (path: string) =>
+      path === "C:\\custom\\bash.exe" || path === "C:\\Program Files\\Git\\bin\\bash.exe";
+    assert.equal(
+      resolveBashFor("win32", { ProgramFiles: "C:\\Program Files" }, exists, "C:\\custom\\bash.exe"),
+      "C:\\custom\\bash.exe",
+      "shellPath wins",
+    );
+    assert.equal(
+      resolveBashFor("win32", { ProgramFiles: "C:\\Program Files" }, exists),
+      "C:\\Program Files\\Git\\bin\\bash.exe",
+      "Git Bash wins over a bare PATH bash/WSL stub",
+    );
+    assert.equal(
+      resolveBashFor("win32", { ProgramFiles: "C:\\Program Files" }, () => false),
+      "bash",
+    );
+    assert.equal(resolveBashFor("linux", {}, () => false), "bash");
+  });
+
+  it("desktop availability honours PI_SUBAGENT_HC_BIN", () => {
+    const dir = createTestDir();
+    const bin = join(dir, "hc with space.exe");
+    writeFileSync(bin, "");
+    const saved = {
+      env: process.env.HERDR_ENV,
+      herdrBin: process.env.HERDR_BIN_PATH,
+      hcBin: process.env.PI_SUBAGENT_HC_BIN,
+      terminal: process.env.HC_TERMINAL_ID,
+    };
+    try {
+      delete process.env.HERDR_ENV;
+      delete process.env.HERDR_BIN_PATH;
+      process.env.HC_TERMINAL_ID = "t1";
+      process.env.PI_SUBAGENT_HC_BIN = bin;
+      assert.equal(isHerdrDesktopAvailable(), true, "an explicit existing hc path is available");
+      process.env.PI_SUBAGENT_HC_BIN = join(dir, "missing hc.exe");
+      assert.equal(isHerdrDesktopAvailable(), false, "a missing explicit hc path is unavailable");
+    } finally {
+      for (const [key, value] of [
+        ["HERDR_ENV", saved.env],
+        ["HERDR_BIN_PATH", saved.herdrBin],
+        ["PI_SUBAGENT_HC_BIN", saved.hcBin],
+        ["HC_TERMINAL_ID", saved.terminal],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("knows a subagent ended from herdr-core's record, not its screen", () => {

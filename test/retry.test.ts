@@ -357,7 +357,7 @@ it("MCP tools are refused instead of loading builtin:mcp", () => {
   assert.equal(api.getToolExtensionPath("mcp__github__search"), undefined);
   assert.throws(
     () => api.resolveToolExtensions("read,mcp__github__search"),
-    /MCP tool .* cannot be granted .* would expose every configured MCP server/,
+    /MCP tool .* cannot be granted .* connects every enabled MCP server .* per-tool isolation is not verified/,
   );
 });
 
@@ -397,6 +397,155 @@ it("pinned provider and auth extensions that disappeared fail before spawn", asy
           { artifactDir: dir, name: "x" },
         ),
       /pinned Anthropic auth extension/,
+    );
+  });
+});
+
+it("resolves an omitted model from the child's settings, not the parent model", async () => {
+  await withTempDir("pi-child-model-", (dir) => {
+    const agentDir = join(dir, "agent");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ defaultProvider: "magpie", defaultModel: "group/master" }),
+    );
+    assert.deepEqual(
+      api.resolveChildInitialModel({
+        explicitModel: null,
+        sessionMode: "standalone",
+        parentSessionFile: join(dir, "parent.jsonl"),
+        agentDir,
+        childCwd: join(dir, "repo"),
+      }),
+      { model: "magpie/group/master" },
+    );
+  });
+});
+
+it("uses project settings defaults for an omitted model", async () => {
+  await withTempDir("pi-child-project-model-", (dir) => {
+    const agentDir = join(dir, "agent");
+    mkdirSync(agentDir, { recursive: true });
+    const repo = join(dir, "repo");
+    mkdirSync(join(repo, ".pi"), { recursive: true });
+    writeFileSync(
+      join(repo, ".pi", "settings.json"),
+      JSON.stringify({ defaultProvider: "openrouter", defaultModel: "z-ai/glm" }),
+    );
+    assert.deepEqual(
+      api.resolveChildInitialModel({
+        explicitModel: null,
+        sessionMode: "standalone",
+        parentSessionFile: join(dir, "parent.jsonl"),
+        agentDir,
+        childCwd: repo,
+      }),
+      { model: "openrouter/z-ai/glm" },
+    );
+  });
+});
+
+it("refuses an omitted model when enabledModels scopes selection", async () => {
+  await withTempDir("pi-child-scoped-", (dir) => {
+    const agentDir = join(dir, "agent");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({
+        defaultProvider: "magpie",
+        defaultModel: "group/master",
+        enabledModels: ["magpie/group/*"],
+      }),
+    );
+    const result = api.resolveChildInitialModel({
+      explicitModel: null,
+      sessionMode: "standalone",
+      parentSessionFile: join(dir, "parent.jsonl"),
+      agentDir,
+      childCwd: join(dir, "repo"),
+    });
+    assert.ok("error" in result);
+    assert.match(result.error, /enabledModels/);
+  });
+});
+
+it("refuses an omitted model when the child settings have no defaults", async () => {
+  await withTempDir("pi-child-no-default-", (dir) => {
+    const agentDir = join(dir, "agent");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, "settings.json"), "{}");
+    const result = api.resolveChildInitialModel({
+      explicitModel: null,
+      sessionMode: "standalone",
+      parentSessionFile: join(dir, "parent.jsonl"),
+      agentDir,
+      childCwd: join(dir, "repo"),
+    });
+    assert.ok("error" in result);
+    assert.match(result.error, /defaultProvider\/defaultModel/);
+  });
+});
+
+it("resolves a fork's model from the parent session's last model_change", async () => {
+  await withTempDir("pi-child-fork-model-", (dir) => {
+    const parent = join(dir, "parent.jsonl");
+    writeFileSync(
+      parent,
+      [
+        JSON.stringify({ type: "model_change", provider: "anthropic", modelId: "claude-haiku" }),
+        JSON.stringify({ type: "message", message: { role: "user", content: [] } }),
+        JSON.stringify({ type: "model_change", provider: "magpie", modelId: "group/master" }),
+      ].join("\n") + "\n",
+    );
+    assert.deepEqual(
+      api.resolveChildInitialModel({
+        explicitModel: null,
+        sessionMode: "fork",
+        parentSessionFile: parent,
+        agentDir: join(dir, "agent"),
+        childCwd: join(dir, "repo"),
+      }),
+      { model: "magpie/group/master" },
+    );
+  });
+});
+
+it("refuses a fork without a recorded model and prefers an explicit model", async () => {
+  await withTempDir("pi-child-fork-no-model-", (dir) => {
+    const parent = join(dir, "parent.jsonl");
+    writeFileSync(parent, JSON.stringify({ type: "message", message: { role: "user", content: [] } }) + "\n");
+    const result = api.resolveChildInitialModel({
+      explicitModel: null,
+      sessionMode: "fork",
+      parentSessionFile: parent,
+      agentDir: join(dir, "agent"),
+      childCwd: join(dir, "repo"),
+    });
+    assert.ok("error" in result);
+    assert.match(result.error, /no recorded model/);
+
+    assert.deepEqual(
+      api.resolveChildInitialModel({
+        explicitModel: "deepseek/deepseek-flash",
+        sessionMode: "fork",
+        parentSessionFile: parent,
+        agentDir: join(dir, "agent"),
+        childCwd: join(dir, "repo"),
+      }),
+      { model: "deepseek/deepseek-flash" },
+    );
+  });
+});
+
+it("refuses to replay a null-model snapshot with no provider snapshot", async () => {
+  await withTempDir("pi-null-model-snapshot-", (dir) => {
+    assert.throws(
+      () =>
+        api.applySandboxToParts([], loadout({ model: null }), {
+          artifactDir: dir,
+          name: "x",
+        }),
+      /without a recorded model or provider snapshot/,
     );
   });
 });

@@ -25,12 +25,13 @@
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { isAbsolute, basename, dirname, join } from "node:path";
 import {
   closeDesktopSurface,
   createDesktopSurface,
   desktopExitState,
+  hcBin,
   isHerdrDesktopEnv,
   isPendingDesktopSurface,
   launchDesktopSurface,
@@ -53,13 +54,18 @@ function hasCommand(command: string): boolean {
 
   let available = false;
   try {
-    // Windows has no `sh` for a native process; `where` answers the same question.
-    if (process.platform === "win32") {
+    // An explicit binary path is not a PATH lookup. PI_SUBAGENT_HC_BIN may
+    // point at an absolute executable outside PATH.
+    if (isAbsolute(command) || /[\\/]/.test(command)) {
+      available = existsSync(command);
+    } else if (process.platform === "win32") {
+      // Windows has no `sh` for a native process; `where` answers the same question.
       execFileSync("where.exe", [command], { stdio: "ignore" });
+      available = true;
     } else {
       execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
+      available = true;
     }
-    available = true;
   } catch {
     available = false;
   }
@@ -89,7 +95,7 @@ export function isHerdrAvailable(): boolean {
  * reachable, and not inside a Herdr TUI pane (which wins when both apply).
  */
 export function isHerdrDesktopAvailable(): boolean {
-  return !isHerdrAvailable() && isHerdrDesktopEnv() && hasCommand("hc");
+  return !isHerdrAvailable() && isHerdrDesktopEnv() && hasCommand(hcBin());
 }
 
 export function isMuxAvailable(): boolean {
@@ -172,59 +178,9 @@ function herdrErrorMessage(error: any): string {
 }
 
 // ── Shell helpers ──
-
-export function shellEscape(s: string): string {
-  return "'" + s.replace(/'/g, "'\\''") + "'";
-}
-
-// ── Bash for launch scripts ──
-
-let resolvedBash: string | null = null;
-
-/**
- * Resolve the Bash that runs launch scripts, mirroring Pi's own resolution:
- * `shellPath` from settings.json, then Git Bash, then PATH.
- *
- * On Windows a bare `bash` usually resolves to the WSL launcher in
- * `%SystemRoot%\System32`, which re-parses its command line and strips the
- * backslashes out of a Windows script path, so Git Bash has to win.
- */
-export function resolveBash(): string {
-  if (resolvedBash) return resolvedBash;
-
-  if (process.platform !== "win32") {
-    resolvedBash = "bash";
-    return resolvedBash;
-  }
-
-  const configured = process.env.PI_SHELL_PATH?.trim() || readShellPathSetting();
-  const candidates = [
-    configured,
-    join(process.env.ProgramFiles ?? "C:\\Program Files", "Git", "bin", "bash.exe"),
-    join(
-      process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)",
-      "Git",
-      "bin",
-      "bash.exe",
-    ),
-    "C:\\msys64\\usr\\bin\\bash.exe",
-  ].filter((candidate): candidate is string => !!candidate?.trim());
-
-  resolvedBash = candidates.find((candidate) => existsSync(candidate)) ?? "bash";
-  return resolvedBash;
-}
-
-/** `shellPath` from the global settings, the same knob that configures Pi's own shell. */
-function readShellPathSetting(): string {
-  try {
-    const agentDir =
-      process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
-    const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8"));
-    return typeof settings?.shellPath === "string" ? settings.shellPath : "";
-  } catch {
-    return "";
-  }
-}
+// Shared with herdr-desktop.ts, which must not import this module (cycle).
+export { resolveBash, shellEscape } from "./shell.ts";
+import { resolveBash, shellEscape } from "./shell.ts";
 
 /**
  * The POSIX form of `dir` as seen by the resolved Bash (`/c/...` for Git Bash,
