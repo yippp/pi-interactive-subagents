@@ -546,21 +546,122 @@ function canonicalizePath(path: string): string {
   }
 }
 
-/**
- * Nearest ancestor trust decision for `cwd`, mirroring pi's trust store.
- * Returns null when no entry exists or the store cannot be read.
- */
-function projectTrustDecision(agentDir: string, cwd: string): boolean | null {
-  const store = readJsonSettings(join(agentDir, "trust.json"));
-  if (!store || typeof store !== "object" || Array.isArray(store)) return null;
+type SettingsFileLoad =
+  | { kind: "ok"; value: Record<string, any> }
+  | { kind: "missing" }
+  | { kind: "invalid"; error: string };
+
+function loadSettingsFile(file: string): SettingsFileLoad {
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch (error: any) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return { kind: "missing" };
+    return { kind: "invalid", error: error?.message ?? String(error) };
+  }
+  try {
+    const parsed = JSON.parse(raw.replace(/^\uFEFF/, ""));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { kind: "invalid", error: "expected a JSON object" };
+    }
+    return { kind: "ok", value: parsed as Record<string, any> };
+  } catch (error: any) {
+    return { kind: "invalid", error: error?.message ?? String(error) };
+  }
+}
+
+type TrustStoreLoad =
+  | { kind: "missing" }
+  | { kind: "ok"; store: Record<string, unknown> }
+  | { kind: "invalid"; error: string };
+
+function loadTrustStore(agentDir: string): TrustStoreLoad {
+  const file = join(agentDir, "trust.json");
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch (error: any) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return { kind: "missing" };
+    return { kind: "invalid", error: error?.message ?? String(error) };
+  }
+  try {
+    const parsed = JSON.parse(raw.replace(/^\uFEFF/, ""));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { kind: "invalid", error: "expected a JSON object" };
+    }
+    for (const [key, value] of Object.entries(parsed)) {
+      if (value !== true && value !== false && value !== null) {
+        return {
+          kind: "invalid",
+          error: `value for ${JSON.stringify(key)} must be true, false, or null`,
+        };
+      }
+    }
+    return { kind: "ok", store: parsed as Record<string, unknown> };
+  } catch (error: any) {
+    return { kind: "invalid", error: error?.message ?? String(error) };
+  }
+}
+
+/** Nearest ancestor trust decision, mirroring pi's trust store lookup. */
+function nearestTrustDecision(
+  store: Record<string, unknown>,
+  cwd: string,
+): boolean | null {
   let current = canonicalizePath(cwd);
   for (;;) {
-    const value = (store as Record<string, unknown>)[current];
+    const value = store[current];
     if (value === true || value === false) return value;
     const parent = dirname(current);
     if (parent === current) return null;
     current = parent;
   }
+}
+
+/**
+ * Decide whether the child would load project settings, following pi's
+ * `resolveProjectTrusted` order: an explicit trust-store decision first,
+ * then `defaultProjectTrust` (`always` / `never` / `ask`). `ask` cannot be
+ * resolved without the child's UI, so it fails closed.
+ *
+ * Project extensions can answer the `project_trust` event before the store;
+ * their decision cannot be replicated here, so a project `.pi/extensions`
+ * directory also fails closed.
+ */
+function resolveProjectSettingsTrust(opts: {
+  agentDir: string;
+  childCwd: string;
+  globalSettings: Record<string, any>;
+}): { trusted: boolean } | { error: string } {
+  if (existsSync(join(opts.childCwd, ".pi", "extensions"))) {
+    return {
+      error:
+        `project extensions in ${join(opts.childCwd, ".pi", "extensions")} can decide project trust ` +
+        `at runtime, so the effective trust cannot be verified here; set model: explicitly.`,
+    };
+  }
+
+  const store = loadTrustStore(opts.agentDir);
+  if (store.kind === "invalid") {
+    return {
+      error:
+        `cannot read trust store ${join(opts.agentDir, "trust.json")}: ${store.error}; ` +
+        `set model: explicitly.`,
+    };
+  }
+  const explicit = store.kind === "ok" ? nearestTrustDecision(store.store, opts.childCwd) : null;
+  if (explicit === false) return { trusted: false };
+  if (explicit === true) return { trusted: true };
+
+  const fallback = opts.globalSettings.defaultProjectTrust;
+  if (fallback === "always") return { trusted: true };
+  if (fallback === "never") return { trusted: false };
+  return {
+    error:
+      `project trust for ${opts.childCwd} is unresolved ` +
+      `(no trust decision and defaultProjectTrust is ${typeof fallback === "string" ? `"${fallback}"` : "unset (ask)"}); ` +
+      `set model: explicitly.`,
+  };
 }
 
 function globToRegExp(pattern: string): RegExp {
@@ -647,22 +748,43 @@ function resolveChildInitialModel(opts: {
     };
   }
 
-  // Project settings are only loaded by pi when the project is trusted. Read
-  // them only with a verified `true` decision; otherwise a project file could
-  // silently override the global default and invalidate the snapshot.
-  const trust = projectTrustDecision(opts.agentDir, opts.childCwd);
-  if (trust !== true) {
+  // A project settings file matters only when it exists. With no such file
+  // there is nothing to gate: the child uses global settings, matching pi's
+  // `hasTrustRequiringProjectResources` shortcut. When the file exists, follow
+  // pi's order: explicit trust-store decision, then defaultProjectTrust; an
+  // unresolved `ask`, an unreadable store, or project extensions fail closed.
+  // An untrusted project file is never read.
+  const globalFile = join(opts.agentDir, "settings.json");
+  const globalLoad = loadSettingsFile(globalFile);
+  if (globalLoad.kind === "invalid") {
     return {
-      error:
-        `project trust for ${opts.childCwd} is not verified as trusted ` +
-        `(${join(opts.agentDir, "trust.json")}); set model: explicitly.`,
+      error: `cannot read ${globalFile}: ${globalLoad.error}; set model: explicitly.`,
     };
   }
+  const globalSettings = globalLoad.kind === "ok" ? globalLoad.value : {};
 
-  const globalFile = join(opts.agentDir, "settings.json");
   const projectFile = join(opts.childCwd, ".pi", "settings.json");
-  const globalSettings = readJsonSettings(globalFile) ?? {};
-  const projectSettings = readJsonSettings(projectFile) ?? {};
+  let projectSettings: Record<string, any> = {};
+  if (existsSync(projectFile)) {
+    const trust = resolveProjectSettingsTrust({
+      agentDir: opts.agentDir,
+      childCwd: opts.childCwd,
+      globalSettings,
+    });
+    if ("error" in trust) return trust;
+    if (trust.trusted) {
+      const projectLoad = loadSettingsFile(projectFile);
+      if (projectLoad.kind !== "ok") {
+        return {
+          error:
+            `cannot read trusted project settings ${projectFile}: ` +
+            `${projectLoad.kind === "invalid" ? projectLoad.error : "file disappeared"}; ` +
+            `set model: explicitly.`,
+        };
+      }
+      projectSettings = projectLoad.value;
+    }
+  }
   const settings = { ...globalSettings, ...projectSettings };
 
   const provider = typeof settings.defaultProvider === "string" ? settings.defaultProvider.trim() : "";
@@ -670,7 +792,7 @@ function resolveChildInitialModel(opts: {
   if (!provider || !modelId) {
     return {
       error:
-        `neither ${globalFile} nor ${projectFile} has defaultProvider/defaultModel; ` +
+        `the effective child settings have no defaultProvider/defaultModel; ` +
         `set model: explicitly.`,
     };
   }

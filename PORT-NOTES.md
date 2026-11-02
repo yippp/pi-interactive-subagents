@@ -36,16 +36,19 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   run, and report once. Missing or corrupt session transcripts are reported in
   the result rather than thrown.
 - Provider/auth snapshot — when a profile omits `model:`, the effective child
-  model is resolved **before** any surface opens: a fork uses the parent
-  session's last `model_change`; otherwise the child cwd must have a verified
-  trusted project, settings must provide `defaultProvider` + `defaultModel`,
-  and `enabledModels` (if present) must include that default. A stored
-  `defaultModel` that already starts with the provider is not double-prefixed.
-  The resolved model is pinned in the loadout, then `providerExtensions` and
-  `providerAuthExtension` are snapshotted from it. The parent's current
-  `ctx.model` is not used. Untrusted projects, missing defaults, out-of-scope
-  defaults, and invalid patterns are refused instead of snapshotting the wrong
-  provider.
+  model is resolved **before** any surface opens. A fork uses the parent
+  session's last `model_change`; otherwise the child's project settings are
+  considered only when trust resolves true (explicit decision, or
+  `defaultProjectTrust` `always`; `ask`/extensions/unreadable store fail
+  closed). If there is no project settings file, no trust gate is applied and
+  global settings are used. An untrusted project file is not read. Settings
+  must provide `defaultProvider` + `defaultModel`, and `enabledModels` (if
+  present) must include the default; a stored `defaultModel` that already starts
+  with the provider is not double-prefixed. The resolved model is pinned in the
+  loadout, then `providerExtensions` and `providerAuthExtension` are snapshotted
+  from it. The parent's current `ctx.model` is not used. Missing defaults,
+  out-of-scope defaults, invalid patterns, and unresolved trust are refused
+  instead of snapshotting the wrong provider.
 - Tool source mapping — `getToolExtensionPath` now resolves `sourceInfo.path`
   from `getAllTools()` for npm/git/local extensions instead of guessing
   `<agent dir>/extensions/<name>/index.ts`. This is what makes
@@ -91,15 +94,22 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 - Profiles without `tools:` are read-only. All bundled agents declare tools;
   a local agent that relies on implicit full access must add `tools:`.
 - Profiles without `model:` are accepted only when the child's effective model
-  can be resolved reliably. A fork uses its recorded `model_change`; otherwise
-  the child project must have a verified `true` trust decision, settings must
-  provide `defaultProvider` + `defaultModel`, and `enabledModels` (if present)
-  must include that default. The resolved model is pinned for the run, and a
-  stored `defaultModel` that already begins with the provider is not
-  double-prefixed. Otherwise spawn is refused with an explicit error; set
-  `model:` in the profile. The parent's `ctx.model` is deliberately ignored;
-  project settings are never read when trust is absent or false, because they
-  could silently override the global default.
+  can be resolved reliably. A fork uses its recorded `model_change`. Otherwise:
+  - No project `.pi/settings.json` means no trust gate (matching pi's
+    `hasTrustRequiringProjectResources` shortcut); global settings apply.
+  - If project settings exist, an explicit trust-store decision wins; with no
+    decision, `defaultProjectTrust` `always` trusts and `never` denies. An
+    unresolved `ask`, an unreadable trust store, or a project `.pi/extensions`
+    directory (whose `project_trust` handlers cannot be replicated) fails
+    closed.
+  - An untrusted project file is **never read**; global defaults apply.
+  - Settings must provide `defaultProvider` + `defaultModel`; `enabledModels`
+    (if present) must include that default. A stored `defaultModel` that
+    already begins with the provider is not double-prefixed.
+
+  The resolved model is pinned for the run. Otherwise spawn is refused with an
+  explicit error; set `model:` in the profile. The parent's `ctx.model` is
+  deliberately ignored.
 - Pre-port loadout snapshots without a tool list cannot be resumed. Spawn a
   fresh named agent instead.
 - `subagent_wait` state is in memory. After `/reload` or restart, resume the
@@ -113,7 +123,7 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 221 tests, 221 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 225 tests, 225 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
   works if `PI_SUBAGENT_ALLOWED` is unset.
@@ -126,8 +136,10 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   the same run id, exhaustion, retry-start failure, retry/summary/delivery
   exceptions, missing and corrupt transcripts, seeded-session summary
   baseline, parallel retries, MCP refusal, pinned provider/auth failure,
-  omitted-model resolution from trusted child settings and forks, refusal on
-  untrusted projects/out-of-scope enabledModels/missing defaults, provider
+  omitted-model resolution from trusted child settings and forks, the
+  home-directory setup (defaultProjectTrust always, no project settings),
+  explicit deny/never global fallback, project extensions and unreadable trust
+  store fail-closed, out-of-scope enabledModels/missing defaults, provider
   prefix handling, and refusal of null-model snapshots).
 - Windows hc launch tests cover an absolute Git Bash plus a script and cwd
   containing spaces, `resolveBashFor` precedence (configured shell, Program
@@ -194,9 +206,12 @@ no per-server isolation for MCP.
 11. The fork/lineage summary baseline is tested at the `summarizeAttempt`
     level, not by spawning a real seeded fork session. Verify with a live fork
     run before relying on the last-message summary.
-12. Omitted-model resolution reads the child's trusted project/global settings
-    and a fork's recorded `model_change`. It refuses when project trust is not
-    verified `true`, defaults are absent or patterned, or the default is not in
-    `enabledModels` scope. `enabledModels` matching uses conservative globs; a
-    fuzzy pattern that cannot be proven to include the default is refused even
-    though pi might resolve it. Set `model:` explicitly where that matters.
+12. Omitted-model resolution follows pi's trust order but cannot run project
+    extension `project_trust` handlers: a project `.pi/extensions` directory
+    fails closed. With no project settings file no trust gate is applied. When
+    one exists, explicit trust-store decisions win; `always`/`never` are
+    honoured; unresolved `ask` and unreadable stores are refused. An untrusted
+    project file is never read; global defaults apply. `enabledModels` matching
+    uses conservative globs, so a fuzzy pattern that cannot be proven to include
+    the default is refused even though pi might resolve it. Set `model:`
+    explicitly where that matters.

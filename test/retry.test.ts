@@ -47,6 +47,16 @@ function writeTrust(agentDir: string, cwd: string, decision: boolean) {
   );
 }
 
+function resolveModel(agentDir: string, childCwd: string, dir: string) {
+  return api.resolveChildInitialModel({
+    explicitModel: null,
+    sessionMode: "standalone",
+    parentSessionFile: join(dir, "parent.jsonl"),
+    agentDir,
+    childCwd,
+  });
+}
+
 function mockExtension(tools: any[] = []) {
   extension({
     on() {
@@ -524,8 +534,99 @@ it("refuses an omitted model when the child settings have no defaults", async ()
   });
 });
 
-it("fails closed when project trust is absent or false, even if settings look valid", async () => {
-  await withTempDir("pi-child-untrusted-", (dir) => {
+it("resolves a home-directory setup: defaultProjectTrust always and no project settings", async () => {
+  await withTempDir("pi-child-no-project-settings-", (dir) => {
+    const agentDir = join(dir, "agent");
+    const repo = join(dir, "repo");
+    mkdirSync(agentDir, { recursive: true });
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({
+        defaultProjectTrust: "always",
+        defaultProvider: "magpie",
+        defaultModel: "group/master",
+        enabledModels: ["magpie/group/*"],
+      }),
+    );
+    // No repo/.pi/settings.json and no trust.json: nothing to gate on.
+    assert.deepEqual(resolveModel(agentDir, repo, dir), { model: "magpie/group/master" });
+
+    // The same holds with the default "ask" when no project settings exist.
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ defaultProvider: "magpie", defaultModel: "group/master" }),
+    );
+    assert.deepEqual(resolveModel(agentDir, repo, dir), { model: "magpie/group/master" });
+  });
+});
+
+it("respects explicit deny first and never reads an untrusted project file", async () => {
+  await withTempDir("pi-child-explicit-deny-", (dir) => {
+    const agentDir = join(dir, "agent");
+    const repo = join(dir, "repo");
+    mkdirSync(agentDir, { recursive: true });
+    mkdirSync(join(repo, ".pi"), { recursive: true });
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({
+        defaultProjectTrust: "always",
+        defaultProvider: "magpie",
+        defaultModel: "group/master",
+      }),
+    );
+    // Invalid JSON: reading it must fail, so a successful global fallback
+    // proves the untrusted project file was never read.
+    writeFileSync(join(repo, ".pi", "settings.json"), "{not json");
+    writeTrust(agentDir, repo, false);
+    assert.deepEqual(resolveModel(agentDir, repo, dir), { model: "magpie/group/master" });
+
+    writeTrust(agentDir, repo, true);
+    const trusted = resolveModel(agentDir, repo, dir);
+    assert.ok("error" in trusted);
+    assert.match(trusted.error, /cannot read trusted project settings/);
+  });
+});
+
+it("uses defaultProjectTrust always/never when no explicit decision exists", async () => {
+  await withTempDir("pi-child-default-trust-", (dir) => {
+    const agentDir = join(dir, "agent");
+    const repo = join(dir, "repo");
+    mkdirSync(agentDir, { recursive: true });
+    mkdirSync(join(repo, ".pi"), { recursive: true });
+    writeFileSync(
+      join(repo, ".pi", "settings.json"),
+      JSON.stringify({ defaultProvider: "openrouter", defaultModel: "z-ai/glm" }),
+    );
+
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({
+        defaultProjectTrust: "always",
+        defaultProvider: "magpie",
+        defaultModel: "group/master",
+      }),
+    );
+    assert.deepEqual(resolveModel(agentDir, repo, dir), { model: "openrouter/z-ai/glm" });
+
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({
+        defaultProjectTrust: "never",
+        defaultProvider: "magpie",
+        defaultModel: "group/master",
+      }),
+    );
+    assert.deepEqual(resolveModel(agentDir, repo, dir), { model: "magpie/group/master" });
+
+    // An explicit true still wins over defaultProjectTrust=never.
+    writeTrust(agentDir, repo, true);
+    assert.deepEqual(resolveModel(agentDir, repo, dir), { model: "openrouter/z-ai/glm" });
+  });
+});
+
+it("fails closed for unresolved ask trust and for project extensions", async () => {
+  await withTempDir("pi-child-unresolved-trust-", (dir) => {
     const agentDir = join(dir, "agent");
     const repo = join(dir, "repo");
     mkdirSync(agentDir, { recursive: true });
@@ -534,31 +635,63 @@ it("fails closed when project trust is absent or false, even if settings look va
       join(agentDir, "settings.json"),
       JSON.stringify({ defaultProvider: "magpie", defaultModel: "group/master" }),
     );
-    // A project file could override the global default; do not silently ignore it.
     writeFileSync(
       join(repo, ".pi", "settings.json"),
       JSON.stringify({ defaultProvider: "openrouter", defaultModel: "z-ai/glm" }),
     );
-    const untrusted = api.resolveChildInitialModel({
-      explicitModel: null,
-      sessionMode: "standalone",
-      parentSessionFile: join(dir, "parent.jsonl"),
-      agentDir,
-      childCwd: repo,
-    });
-    assert.ok("error" in untrusted);
-    assert.match(untrusted.error, /project trust/);
+    const ask = resolveModel(agentDir, repo, dir);
+    assert.ok("error" in ask);
+    assert.match(ask.error, /project trust .* unresolved/);
 
-    writeTrust(agentDir, repo, false);
-    const denied = api.resolveChildInitialModel({
-      explicitModel: null,
-      sessionMode: "standalone",
-      parentSessionFile: join(dir, "parent.jsonl"),
-      agentDir,
-      childCwd: repo,
-    });
-    assert.ok("error" in denied);
-    assert.match(denied.error, /project trust/);
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({
+        defaultProjectTrust: "always",
+        defaultProvider: "magpie",
+        defaultModel: "group/master",
+      }),
+    );
+    mkdirSync(join(repo, ".pi", "extensions"), { recursive: true });
+    const extensions = resolveModel(agentDir, repo, dir);
+    assert.ok("error" in extensions);
+    assert.match(extensions.error, /project extensions/);
+  });
+});
+
+it("fails closed on an unreadable trust store but explicit models bypass trust", async () => {
+  await withTempDir("pi-child-bad-trust-", (dir) => {
+    const agentDir = join(dir, "agent");
+    const repo = join(dir, "repo");
+    mkdirSync(agentDir, { recursive: true });
+    mkdirSync(join(repo, ".pi"), { recursive: true });
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({
+        defaultProjectTrust: "always",
+        defaultProvider: "magpie",
+        defaultModel: "group/master",
+      }),
+    );
+    writeFileSync(
+      join(repo, ".pi", "settings.json"),
+      JSON.stringify({ defaultProvider: "openrouter", defaultModel: "z-ai/glm" }),
+    );
+    writeFileSync(join(agentDir, "trust.json"), "{not json");
+    const bad = resolveModel(agentDir, repo, dir);
+    assert.ok("error" in bad);
+    assert.match(bad.error, /cannot read trust store/);
+
+    assert.deepEqual(
+      api.resolveChildInitialModel({
+        explicitModel: "deepseek/deepseek-flash",
+        sessionMode: "standalone",
+        parentSessionFile: join(dir, "parent.jsonl"),
+        agentDir,
+        childCwd: repo,
+      }),
+      { model: "deepseek/deepseek-flash" },
+      "an explicit model must not consult trust or project settings",
+    );
   });
 });
 
