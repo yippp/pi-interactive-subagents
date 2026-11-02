@@ -98,6 +98,13 @@ export interface SubagentLoadout {
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
   toolAllowlist: string | null;
+  /**
+   * Tool name → extension entry path pinned at spawn time. Resume and retry
+   * replay these exact paths instead of re-resolving them, so a package update
+   * or a parent that no longer loads the extension cannot silently drop a
+   * granted tool.
+   */
+  toolExtensions?: Record<string, string>;
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */

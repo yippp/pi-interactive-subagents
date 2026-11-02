@@ -1195,26 +1195,29 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("worker is granted the spawning toolset restricted to scout and researcher", () => {
-    const worker = testApi.loadAgentDefaults("worker");
-    assert.ok(worker, "expected bundled worker to be discoverable");
-    assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
+  it("worker is granted the spawning toolset restricted to scout and researcher", async () => {
+    await withIsolatedAgentEnv(() => {
+      const worker = testApi.loadAgentDefaults("worker");
+      assert.ok(worker, "expected bundled worker to be discoverable");
+      assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
 
-    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
-    assert.ok(allowlist, "expected an allowlist");
-    const tools = new Set(allowlist!.split(","));
-    for (const t of ["subagent", "subagent_message", "subagents_list"]) {
-      assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
-    }
-    assert.ok(tools.has("bash"), "expected worker to keep bash");
+      const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
+      const tools = new Set(allowlist.split(","));
+      for (const t of ["subagent", "subagent_message", "subagents_list", "subagent_wait"]) {
+        assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
+      }
+      assert.ok(tools.has("bash"), "expected worker to keep bash");
+    });
   });
 
-  it("scout and researcher are not granted spawning tools", () => {
-    for (const name of ["scout", "researcher"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
-    }
+  it("scout and researcher are not granted spawning tools", async () => {
+    await withIsolatedAgentEnv(() => {
+      for (const name of ["scout", "researcher"]) {
+        const defs = testApi.loadAgentDefaults(name);
+        assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+        assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
+      }
+    });
   });
 
   it("getToolExtensionPath maps custom tools and skips built-ins", async () => {
@@ -1225,8 +1228,8 @@ describe("subagent discovery", () => {
 
       assert.equal(testApi.getToolExtensionPath("read"), undefined);
       assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-      assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-      assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+      assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith(join("web-search", "index.ts")));
+      assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith(join("tools", "safe-bash.ts")));
       // Spawning tools are registered by this extension itself.
       assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
     });
@@ -1296,9 +1299,22 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
-    assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
-    assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+  it("buildSubagentToolAllowlist defaults to read-only without an explicit tool restriction", () => {
+    assert.equal(
+      testApi.buildSubagentToolAllowlist(undefined),
+      "read,grep,find,ls,ask_question",
+    );
+    assert.equal(
+      testApi.buildSubagentToolAllowlist(""),
+      "read,grep,find,ls,ask_question",
+    );
+    // A spawning grant adds the control tools without inheriting write/bash.
+    const granted = new Set(
+      testApi.buildSubagentToolAllowlist(undefined, { grantSpawning: true }).split(","),
+    );
+    assert.ok(granted.has("subagent"));
+    assert.ok(!granted.has("bash"));
+    assert.ok(!granted.has("write"));
   });
 
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
@@ -1435,26 +1451,28 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("applySandboxToParts omits restriction flags when the loadout was unrestricted", () => {
+  it("rejects a legacy unrestricted loadout instead of relaunching with all tools", () => {
     withTempDir((d) => {
-      const parts: string[] = [];
-      testApi.applySandboxToParts(
-        parts,
-        {
-          agent: null,
-          toolAllowlist: null,
-          model: null,
-          thinking: null,
-          systemPromptMode: null,
-          identity: null,
-          spawnable: null,
-          autoExit: false,
-          cwd: null,
-          agentDir: null,
-        },
-        { artifactDir: d, name: "fork" },
+      assert.throws(
+        () =>
+          testApi.applySandboxToParts(
+            [],
+            {
+              agent: null,
+              toolAllowlist: null,
+              model: null,
+              thinking: null,
+              systemPromptMode: null,
+              identity: null,
+              spawnable: null,
+              autoExit: false,
+              cwd: null,
+              agentDir: null,
+            },
+            { artifactDir: d, name: "fork" },
+          ),
+        /Legacy unrestricted/,
       );
-      assert.deepEqual(parts, []);
     });
   });
 

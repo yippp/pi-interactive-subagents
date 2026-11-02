@@ -52,12 +52,38 @@ If your shell startup is slow and launch commands get dropped before the prompt 
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 ```
 
+### Pi-Bolt and restricted children
+
+A Pi-Bolt host spawns `pi-bolt.exe` itself for each child, so sub-agents run the
+same build as the parent. npm/git Pi hosts keep `pi` from `PATH`. Override the
+binary for testing or pinning:
+
+```bash
+export PI_SUBAGENT_PI_BIN=/path/to/pi-bolt
+```
+
+Restricted children run with `--no-extensions` plus one `-e` per granted tool.
+Tool names resolve to the extension file pi actually loaded, including npm
+packages, so `fetch_content`, `get_search_content`, and `source_check` work
+without hard-coded install paths. A tool that cannot be resolved fails the
+spawn before a surface opens. Provider extensions are loaded for their model
+prefix (`antigravity-acp`); the Anthropic OAuth transport extension is kept.
+
+A run that ends with a provider/agent error is resumed in a fresh surface with
+the same session and a continuation message. Default: 3 extra attempts; set
+`PI_SUBAGENT_RETRY_MAX=0` to disable.
+
+Run `/subagent-doctor` to print each agent's resolved allowlist and extension
+paths, provider-extension status, and Herdr availability. It does not call a
+model.
+
 ## Tools
 
 | Tool | Description |
 | --- | --- |
 | `subagent` | Spawn a sub-agent in a dedicated Herdr tab (or pane, when nested) (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
+| `subagent_wait` | Join named sub-agents by lifecycle events: `all`/`any`, timeout, early return on a child question. Never cancels children |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
@@ -135,8 +161,8 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
-| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `powershell`, `grep`, `find`, `ls`. Extension-backed tools are resolved through pi's loaded-tool provenance, so npm, git, and local extensions all work (`web_search`, `fetch_content`, `safe_bash`, …). Only the extensions backing the listed tools are loaded into the child. **Omit `tools:` and the child is read-only** (`read`, `grep`, `find`, `ls`) |
+| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagent_wait`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
 | `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
