@@ -523,6 +523,39 @@ it("encodes Windows drive and path dialects without polluting the default tree",
   assert.equal(dirname(encoded), join("C:\\agent dir", "sessions"));
 });
 
+it("normalizes Git Bash/MSYS/Cygwin cwds to the same native encoding as pi", () => {
+  // The platform is passed explicitly so this mapping is verifiable on any host.
+  const norm = (value: string) => api.normalizeWindowsShellPath(value, "win32");
+  assert.equal(norm("/g/repo"), "G:\\repo");
+  assert.equal(norm("/mnt/c/repo/sub"), "C:\\repo\\sub");
+  assert.equal(norm("/cygdrive/g/repo"), "G:\\repo");
+  assert.equal(norm("/G/Repo"), "G:\\Repo", "drive letter is upper-cased");
+  assert.equal(norm("G:\\repo"), "G:\\repo", "native paths are unchanged");
+  assert.equal(norm("//server/share/repo"), "//server/share/repo", "UNC is preserved");
+  assert.equal(norm("/usr/local/bin"), "/usr/local/bin", "non-drive paths are unchanged");
+  assert.equal(norm("/c"), "C:\\", "a bare drive root keeps its separator");
+  assert.equal(
+    api.normalizeWindowsShellPath("/g/repo", "linux"),
+    "/g/repo",
+    "non-Windows hosts leave the path alone",
+  );
+});
+
+it("encodes a Git Bash cwd identically to its native Windows path", () => {
+  const agentDir = "C:\\agent dir";
+  const variants = ["/g/repo", "/mnt/g/repo", "/cygdrive/g/repo", "G:\\repo"];
+  const encoded = variants.map((cwd) => api.defaultSessionDirPath(cwd, agentDir));
+  if (process.platform === "win32") {
+    for (const value of encoded) {
+      assert.equal(value, encoded[0], `session group must match for ${variants.join(", ")}`);
+      assert.equal(basename(value), "--G--repo--");
+    }
+  } else {
+    // On POSIX hosts the shell-style paths are ordinary absolute paths.
+    assert.ok(encoded.every((value) => isAbsolute(value)));
+  }
+});
+
 it("seeds a fork in an explicit lab dir with the child cwd in its header", async () => {
   await withTempDir("pi-session-fork-", (dir) => {
     const parent = join(dir, "parent.jsonl");

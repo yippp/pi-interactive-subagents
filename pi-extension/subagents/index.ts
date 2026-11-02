@@ -514,21 +514,52 @@ function resolveSubagentPaths(
   return { effectiveCwd, localAgentDir, effectiveAgentDir };
 }
 
+/**
+ * Copy of pi's normalizeWindowsShellPath: convert a Git Bash / MSYS / Cygwin /
+ * WSL drive path (`/g/repo`, `/mnt/c/repo`, `/cygdrive/g/repo`) into the native
+ * `G:\repo` form. Only applies on Windows, and leaves UNC paths (`//server/...`)
+ * and paths that already contain a backslash alone.
+ */
+export function normalizeWindowsShellPath(
+  filePath: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform !== "win32") return filePath;
+  if (!filePath.startsWith("/") || filePath.startsWith("//") || filePath.includes("\\")) {
+    return filePath;
+  }
+  const match = filePath.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+  if (!match) return filePath;
+  const suffix = match[2]?.replaceAll("/", "\\");
+  return `${match[1].toUpperCase()}:\\${suffix ?? ""}`;
+}
+
+/** Resolve a cwd the way pi does before encoding a session directory. */
+function resolvedCwdForEncoding(cwd: string): string {
+  // pi's resolvePath() calls normalizePath() first, so a shell-style drive path
+  // becomes a native Windows path before it is resolved and encoded. Without
+  // this, `/g/repo` and `G:\repo` would produce different session groups and
+  // the session would not be discoverable.
+  return resolve(normalizeWindowsShellPath(cwd));
+}
+
 function defaultSessionDirPath(cwd: string, agentDir: string): string {
-  // Mirrors pi's getDefaultSessionDirPath: resolvePath() first (absolute,
-  // normalized, no trailing separator / `.` / `..`), then the Windows
+  // Mirrors pi's getDefaultSessionDirPath: resolvePath() first (native path,
+  // absolute, normalized, no trailing separator / `.` / `..`), then the Windows
   // drive-colon encoding (`G:\repo` -> `--G--repo--`). Pure: callers choose
   // whether to create the directory, so an explicit --session-dir is never
   // polluted with an unused default directory.
-  const resolvedCwd = resolve(cwd);
-  const resolvedAgentDir = resolve(agentDir);
+  const resolvedCwd = resolvedCwdForEncoding(cwd);
+  const resolvedAgentDir = resolve(normalizeWindowsShellPath(agentDir));
   const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
   return join(resolvedAgentDir, "sessions", safePath);
 }
 
 function samePath(a: string, b: string): boolean {
-  const left = canonicalizePath(a);
-  const right = canonicalizePath(b);
+  // Normalize shell-style drive paths first, so a parent in `G:\repo` and a
+  // child cwd `/g/repo` are recognized as the same directory.
+  const left = canonicalizePath(resolve(normalizeWindowsShellPath(a)));
+  const right = canonicalizePath(resolve(normalizeWindowsShellPath(b)));
   return process.platform === "win32"
     ? left.toLowerCase() === right.toLowerCase()
     : left === right;
@@ -1788,6 +1819,7 @@ export const __test__ = {
   resolveChildInitialModel,
   resolveChildSessionDir,
   defaultSessionDirPath,
+  normalizeWindowsShellPath,
   getArtifactDir,
   lastModelInSession,
   watchSubagentWithRetry,

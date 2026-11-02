@@ -89,8 +89,10 @@ Child session files go into the parent's actual session directory
 parent cwd before the child changes directory. Artifact and activity paths are
 resolved the same way. A child with an explicit
 cross-project `cwd` uses that project's default session grouping only when the
-parent uses the default session dir. Resume and fork follow the stored session
-file path.
+parent uses the default session dir. A Git Bash / MSYS / Cygwin / WSL `cwd`
+(`/g/repo`, `/mnt/c/repo`) is normalized to its native `G:\repo` form first,
+so it lands in the same session group as the native path. Resume and fork
+follow the stored session file path.
 
 Run `/subagent-doctor` to print each agent's resolved allowlist and extension
 paths, provider-extension status, and Herdr availability. It does not call a

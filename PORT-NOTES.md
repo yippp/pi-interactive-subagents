@@ -60,7 +60,11 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   session dirs, a child in the parent's cwd uses the parent's dir, while an
   explicit cross-project cwd uses that project's default grouping after the
   cwd is resolved and normalized. The path encoding mirrors pi
-  (`--G--repo--`). Resume and fork follow the stored file path.
+  (`--G--repo--`), including its `normalizeWindowsShellPath` step: a Git Bash,
+  MSYS, Cygwin, or WSL cwd (`/g/repo`, `/mnt/c/repo`, `/cygdrive/g/repo`) is
+  converted to the native `G:\repo` form before resolving, so it lands in the
+  same session group as the native path. UNC (`//server/share`) is left alone.
+  Resume and fork follow the stored file path.
 - Tool source mapping — `getToolExtensionPath` now resolves `sourceInfo.path`
   from `getAllTools()` for npm/git/local extensions instead of guessing
   `<agent dir>/extensions/<name>/index.ts`. This is what makes
@@ -135,7 +139,7 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 232 tests, 232 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 234 tests, 234 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
   works if `PI_SUBAGENT_ALLOWED` is unset.
@@ -156,7 +160,9 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 - Child session placement tests cover an explicit lab `--session-dir`
   (including a cross-project cwd and no default-dir pollution), a relative
   session dir resolved against the parent cwd, canonical cwd normalization
-  (trailing separator, `.`, `..`), the parent's actual dir for the same cwd,
+  (trailing separator, `.`, `..`), Git Bash/MSYS/Cygwin/WSL cwd normalization
+  (`/g`, `/mnt/c`, `/cygdrive/g`) against the native encoding with UNC
+  preserved, the parent's actual dir for the same cwd,
   the child cwd's default grouping for cross-project cwd, Windows drive-colon
   encoding, seeding a fork in the lab directory with the child cwd in its
   header, and resolving a relative artifact dir against the parent cwd.
