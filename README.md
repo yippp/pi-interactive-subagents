@@ -85,9 +85,12 @@ the parent. The parent's MCP servers are unaffected.
 Child session files go into the parent's actual session directory
 (`ctx.sessionManager.getSessionDir()`). With `--session-dir` (or settings
 `sessionDir`), sub-agents write there too, not into the user's default
-`~/.pi/agent/sessions` tree. A child with an explicit cross-project `cwd` uses
-that project's default session grouping only when the parent uses the default
-session dir. Resume and fork follow the stored session file path.
+`~/.pi/agent/sessions` tree; a relative session dir is resolved against the
+parent cwd before the child changes directory. Artifact and activity paths are
+resolved the same way. A child with an explicit
+cross-project `cwd` uses that project's default session grouping only when the
+parent uses the default session dir. Resume and fork follow the stored session
+file path.
 
 Run `/subagent-doctor` to print each agent's resolved allowlist and extension
 paths, provider-extension status, and Herdr availability. It does not call a

@@ -2,7 +2,7 @@ import { it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, basename, join, resolve, sep } from "node:path";
+import { dirname, basename, isAbsolute, join, resolve, sep } from "node:path";
 import extension, { __test__ as api } from "../pi-extension/subagents/index.ts";
 import { shellEscape } from "../pi-extension/subagents/herdr.ts";
 import {
@@ -413,6 +413,58 @@ it("subagent_wait releases on a real child question, and a timeout leaves childr
 
 // ── child session directory ──────────────────────────────────────────────────
 
+it("resolves a relative --session-dir against the parent cwd for a cross-project child", async () => {
+  await withTempDir("pi-session-relative-", (dir) => {
+    const parentCwd = join(dir, "parent project");
+    mkdirSync(parentCwd, { recursive: true });
+    const relativeLab = join("lab", "sessions");
+    const chosen = api.resolveChildSessionDir({
+      parentSessionDir: relativeLab,
+      parentCwd,
+      childCwd: join(dir, "other project"),
+      agentDir: join(dir, "agent"),
+      usesDefaultSessionDir: false,
+    });
+    assert.ok(isAbsolute(chosen), "the child must get an absolute session path");
+    assert.equal(chosen, join(parentCwd, "lab", "sessions"));
+
+    // Same cwd also resolves the relative dir absolutely.
+    assert.equal(
+      api.resolveChildSessionDir({
+        parentSessionDir: relativeLab,
+        parentCwd,
+        childCwd: parentCwd,
+        agentDir: join(dir, "agent"),
+        usesDefaultSessionDir: true,
+      }),
+      join(parentCwd, "lab", "sessions"),
+    );
+  });
+});
+
+it("normalizes canonical cwds before encoding the default session dir", async () => {
+  await withTempDir("pi-session-canonical-", (dir) => {
+    const agentDir = join(dir, "agent");
+    const cwd = join(dir, "repo", "sub");
+    const canonical = api.defaultSessionDirPath(cwd, agentDir);
+    assert.equal(api.defaultSessionDirPath(`${cwd}${sep}.`, agentDir), canonical);
+    assert.equal(api.defaultSessionDirPath(`${cwd}${sep}`, agentDir), canonical);
+    assert.equal(
+      api.defaultSessionDirPath(`${cwd}${sep}..${sep}${basename(cwd)}`, agentDir),
+      canonical,
+    );
+
+    const chosen = api.resolveChildSessionDir({
+      parentSessionDir: api.defaultSessionDirPath(join(dir, "parent"), agentDir),
+      parentCwd: join(dir, "parent"),
+      childCwd: `${cwd}${sep}.`,
+      agentDir,
+      usesDefaultSessionDir: true,
+    });
+    assert.equal(chosen, canonical, "an unnormalized cross-project cwd must encode the same dir");
+  });
+});
+
 it("puts child sessions in an explicit parent session dir (--session-dir lab)", async () => {
   await withTempDir("pi-session-lab-", (dir) => {
     const agentDir = join(dir, "agent");
@@ -508,4 +560,11 @@ it("seeds a fork in an explicit lab dir with the child cwd in its header", async
     assert.equal(header.parentSession, parent);
     assert.ok(lines.some((line) => line.includes('"model_change"')));
   });
+});
+
+it("resolves a relative artifact dir against the parent cwd", () => {
+  const relativeSessionDir = join("lab", "sessions");
+  const artifactDir = api.getArtifactDir(relativeSessionDir, "session-1");
+  assert.ok(isAbsolute(artifactDir));
+  assert.equal(artifactDir, resolve(relativeSessionDir, "artifacts", "session-1"));
 });

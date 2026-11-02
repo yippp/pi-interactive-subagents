@@ -53,9 +53,13 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   actual session directory (`ctx.sessionManager.getSessionDir()`), not a
   re-derived default. An explicit `--session-dir` / settings `sessionDir` is
   authoritative for every child, including a cross-project `cwd`, so lab runs
-  do not leak into `~/.pi/agent/sessions`. With default session dirs, a child
-  in the parent's cwd uses the parent's dir, while an explicit cross-project
-  cwd uses that project's default grouping. The path encoding mirrors pi
+  do not leak into `~/.pi/agent/sessions`. A relative session dir is resolved
+  against the parent cwd before the path is passed to the child and stored in
+  the name registry, because the child changes to its own cwd. Artifact and
+  activity paths are resolved the same way. With default
+  session dirs, a child in the parent's cwd uses the parent's dir, while an
+  explicit cross-project cwd uses that project's default grouping after the
+  cwd is resolved and normalized. The path encoding mirrors pi
   (`--G--repo--`). Resume and fork follow the stored file path.
 - Tool source mapping — `getToolExtensionPath` now resolves `sourceInfo.path`
   from `getAllTools()` for npm/git/local extensions instead of guessing
@@ -131,7 +135,7 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 229 tests, 229 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 232 tests, 232 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
   works if `PI_SUBAGENT_ALLOWED` is unset.
@@ -150,10 +154,12 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   store fail-closed, out-of-scope enabledModels/missing defaults, provider
   prefix handling, and refusal of null-model snapshots).
 - Child session placement tests cover an explicit lab `--session-dir`
-  (including a cross-project cwd and no default-dir pollution), the parent's
-  actual dir for the same cwd, the child cwd's default grouping for
-  cross-project cwd, Windows drive-colon encoding, and seeding a fork in the
-  lab directory with the child cwd in its header.
+  (including a cross-project cwd and no default-dir pollution), a relative
+  session dir resolved against the parent cwd, canonical cwd normalization
+  (trailing separator, `.`, `..`), the parent's actual dir for the same cwd,
+  the child cwd's default grouping for cross-project cwd, Windows drive-colon
+  encoding, seeding a fork in the lab directory with the child cwd in its
+  header, and resolving a relative artifact dir against the parent cwd.
 - Windows hc launch tests cover an absolute Git Bash plus a script and cwd
   containing spaces, `resolveBashFor` precedence (configured shell, Program
   Files Git, msys64, never a bare PATH bash), rejection of a non-absolute

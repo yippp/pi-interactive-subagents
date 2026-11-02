@@ -515,12 +515,15 @@ function resolveSubagentPaths(
 }
 
 function defaultSessionDirPath(cwd: string, agentDir: string): string {
-  // Mirrors pi's getDefaultSessionDirPath, including the Windows drive-colon
-  // encoding (`G:\repo` -> `--G--repo--`). Pure: callers choose whether to
-  // create the directory, so an explicit --session-dir is never polluted with
-  // an unused default directory.
-  const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-  return join(agentDir, "sessions", safePath);
+  // Mirrors pi's getDefaultSessionDirPath: resolvePath() first (absolute,
+  // normalized, no trailing separator / `.` / `..`), then the Windows
+  // drive-colon encoding (`G:\repo` -> `--G--repo--`). Pure: callers choose
+  // whether to create the directory, so an explicit --session-dir is never
+  // polluted with an unused default directory.
+  const resolvedCwd = resolve(cwd);
+  const resolvedAgentDir = resolve(agentDir);
+  const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+  return join(resolvedAgentDir, "sessions", safePath);
 }
 
 function samePath(a: string, b: string): boolean {
@@ -537,7 +540,9 @@ function samePath(a: string, b: string): boolean {
  * - An explicit session dir (`--session-dir`, settings `sessionDir`, or a
  *   session file opened from a custom directory) is authoritative: children go
  *   beside the parent, even when the child runs in another project. This keeps
- *   lab runs out of the user's default `~/.pi/agent/sessions` tree.
+ *   lab runs out of the user's default `~/.pi/agent/sessions` tree. A relative
+ *   explicit dir is resolved against the parent cwd so the child process (which
+ *   changes cwd) and the parent's registry/watch paths agree.
  * - With default session dirs and the same cwd, use the parent's actual dir.
  * - With default session dirs and an explicit cross-project cwd, use that
  *   project's default grouping so resume-by-cwd still works.
@@ -549,8 +554,10 @@ function resolveChildSessionDir(opts: {
   agentDir: string;
   usesDefaultSessionDir: boolean;
 }): string {
-  if (!opts.usesDefaultSessionDir) return opts.parentSessionDir;
-  if (samePath(opts.parentCwd, opts.childCwd)) return opts.parentSessionDir;
+  const parentBase = resolve(opts.parentCwd);
+  const parentDir = resolve(parentBase, opts.parentSessionDir);
+  if (!opts.usesDefaultSessionDir) return parentDir;
+  if (samePath(opts.parentCwd, opts.childCwd)) return parentDir;
   return defaultSessionDirPath(opts.childCwd, opts.agentDir);
 }
 
@@ -1014,7 +1021,10 @@ function muxUnavailableResult() {
  *   <sessionDir>/artifacts/<session-id>/
  */
 function getArtifactDir(sessionDir: string, sessionId: string): string {
-  return join(sessionDir, "artifacts", sessionId);
+  // Resolve against the parent cwd: a relative --session-dir must not produce
+  // artifact/activity paths that the child (which changes cwd) interprets
+  // differently from the parent and the name registry.
+  return resolve(sessionDir, "artifacts", sessionId);
 }
 
 const statusConfig = loadStatusConfig();
@@ -1778,6 +1788,7 @@ export const __test__ = {
   resolveChildInitialModel,
   resolveChildSessionDir,
   defaultSessionDirPath,
+  getArtifactDir,
   lastModelInSession,
   watchSubagentWithRetry,
   summarizeAttempt,
