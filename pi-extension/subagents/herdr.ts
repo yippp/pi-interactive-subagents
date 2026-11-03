@@ -632,6 +632,42 @@ export interface PanePiProof {
   name: string;
 }
 
+/**
+ * Check one exact process id: it must still exist, be a Pi executable, and
+ * name this run's session file on its command line. Used when the child
+ * recorded its own pid.
+ */
+function probeRecordedPid(
+  pid: number,
+  expected: { sessionFile: string },
+  platform: NodeJS.Platform,
+  deps: PanePiProbeDeps,
+): PanePiProbe | null {
+  let rows: PaneProcess[];
+  try {
+    rows = deps.processes([pid]);
+  } catch (error: any) {
+    return {
+      ok: false,
+      reason: "probe_unavailable",
+      detail: `could not query the process table: ${error?.message ?? String(error)}`,
+    };
+  }
+  const found = rows.find((row) => row.pid === pid);
+  if (!found) return null; // gone: let the caller report it
+  if (!PI_PROCESS_NAME.test(found.name)) {
+    return { ok: false, reason: "no_child", detail: "the recorded process is not a Pi process" };
+  }
+  if (!found.cmdline || !cmdlineNamesSession(found.cmdline, expected.sessionFile, platform)) {
+    return {
+      ok: false,
+      reason: "session_mismatch",
+      detail: "the recorded process is not running this subagent's session",
+    };
+  }
+  return { ok: true, proof: { pid, name: found.name } };
+}
+
 export type PanePiProbe =
   | { ok: true; proof: PanePiProof }
   | { ok: false; reason: PanePiProbeFailure; detail: string };
@@ -747,11 +783,38 @@ function paneProcessInfo(surface: string): { roots: number[]; foreground: PanePr
 export interface PanePiProbeDeps {
   paneProcessInfo(surface: string): { roots: number[]; foreground: PaneProcess[] };
   descendants(rootPid: number): PaneProcess[];
+  /** Look up specific process ids (empty when they no longer exist). */
+  processes(pids: number[]): PaneProcess[];
+}
+
+/** Look up a few process ids with PowerShell 7. */
+function windowsProcesses(pids: number[]): PaneProcess[] {
+  const wanted = pids.filter((pid) => Number.isInteger(pid) && pid > 0);
+  if (wanted.length === 0) return [];
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `Get-CimInstance -ClassName Win32_Process -Filter "${wanted.map((pid) => `ProcessId=${pid}`).join(" OR ")}" | Select-Object ProcessId, Name, CommandLine | ConvertTo-Json -Compress`,
+  ].join("; ");
+  const stdout = execFileSync(
+    powerShellCommand(),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
+  );
+  const parsed = JSON.parse(stdout.trim() || "[]");
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  return rows
+    .filter((row: any) => row && Number.isInteger(row.ProcessId))
+    .map((row: any) => ({
+      pid: Number(row.ProcessId),
+      name: typeof row.Name === "string" ? row.Name : "",
+      cmdline: typeof row.CommandLine === "string" ? row.CommandLine : undefined,
+    }));
 }
 
 const defaultPanePiProbeDeps: PanePiProbeDeps = {
   paneProcessInfo,
   descendants: windowsDescendants,
+  processes: windowsProcesses,
 };
 
 /**
@@ -768,7 +831,7 @@ const defaultPanePiProbeDeps: PanePiProbeDeps = {
  */
 export function probePanePiProcess(
   surface: string,
-  expected: { sessionFile: string },
+  expected: { sessionFile: string; pid?: number },
   platform: NodeJS.Platform = process.platform,
   deps: PanePiProbeDeps = defaultPanePiProbeDeps,
 ): PanePiProbe {
@@ -788,6 +851,20 @@ export function probePanePiProcess(
       ok: false,
       reason: "probe_unavailable",
       detail: `could not read the pane's processes: ${error?.message ?? String(error)}`,
+    };
+  }
+
+  // Preferred proof: the child recorded its own pid, so no pane process-tree
+  // reasoning is needed. The session file still has to match, which makes a
+  // stale record from another run useless.
+  if (Number.isInteger(expected.pid)) {
+    const recorded = probeRecordedPid(Number(expected.pid), expected, platform, deps);
+    if (recorded && recorded.ok) return recorded;
+    if (recorded) return recorded;
+    return {
+      ok: false,
+      reason: "pane_gone",
+      detail: "the Pi process this subagent recorded is no longer running",
     };
   }
 

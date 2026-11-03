@@ -83,10 +83,12 @@ custom label `pi-bolt`, which Herdr 0.9.5 does not know. In that one case — a
 rejection before anything was written — the message is typed into the pane,
 which is how this extension delivered follow-ups before the agent surface
 existed. Typing requires positive proof that this run's Pi process is alive in
-that pane and runs its session file; a pane that only holds a shell, a
-restarted or foreign session, or an unreadable process table is refused with an
-explanation instead. A child that is still booting is given a short bounded
-window before the refusal:
+that pane and runs its session file: the probe walks both process-tree roots
+Herdr reports (its `shell_pid` and the pane's foreground process group), because
+after `pane run` the shell pid can be the stale original shell. A pane that only
+holds a shell, a restarted or foreign session, or an unreadable process table is
+refused with an explanation instead. A child that is still booting is given a
+short bounded window before the refusal:
 
 ```bash
 export PI_SUBAGENT_STARTUP_PROBE_MS=15000   # default: 15000, 0 disables

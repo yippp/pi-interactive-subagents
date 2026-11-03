@@ -1714,14 +1714,20 @@ async function steerSubagent(
 
   const startupWindowMs = options.startupWindowMs ?? startupProbeWindowMs();
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  let probeResult = probe(running.surface, { sessionFile: running.sessionFile });
+  let probeResult = probe(running.surface, {
+    sessionFile: running.sessionFile,
+    pid: recordedChildPid(running),
+  });
   if (!probeResult.ok && CHILD_NOT_STARTED_REASONS.has(probeResult.reason) && startupWindowMs > 0) {
     // Bounded wait for a child that is still booting. Safety is unchanged: the
     // text is typed only after the same positive proof succeeds.
     const deadline = Date.now() + startupWindowMs;
     while (!probeResult.ok && CHILD_NOT_STARTED_REASONS.has(probeResult.reason) && Date.now() < deadline) {
       await sleep(PROBE_RETRY_INTERVAL_MS);
-      probeResult = probe(running.surface, { sessionFile: running.sessionFile });
+      probeResult = probe(running.surface, {
+        sessionFile: running.sessionFile,
+        pid: recordedChildPid(running),
+      });
     }
   }
   if (!probeResult.ok) {
@@ -1747,6 +1753,13 @@ function steerFailureMessage(running: RunningSubagent, error: any): string {
     `Failed to deliver message to subagent "${running.name}" via Herdr: ` +
     `${error?.message ?? String(error)}`
   );
+}
+
+/** The pid the child recorded in its activity file, when it has one. */
+function recordedChildPid(running: RunningSubagent): number | undefined {
+  if (!running.activityFile) return undefined;
+  const read = readSubagentActivityFile(running.activityFile, running.id);
+  return read.ok && Number.isInteger(read.activity.pid) ? read.activity.pid : undefined;
 }
 
 /** Explain a refused fallback without exposing command lines or task text. */

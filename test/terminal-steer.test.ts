@@ -6,6 +6,7 @@ const pi = { pid: 20, name: "pi-bolt.exe", cmdline: 'pi-bolt.exe --session "C:\\
 const deps = (rows = [pi]) => ({
   paneProcessInfo: () => ({ roots: [10], foreground: [{ pid: 10, name: "bash.exe" }] }),
   descendants: () => rows,
+  processes: () => rows,
 });
 
 test("Windows fallback requires a Pi child with the exact --session argument", () => {
@@ -21,8 +22,48 @@ test("a process started in the pane's foreground job is found even when shell_pi
   const staleShell = {
     paneProcessInfo: () => ({ roots: [10, 11], foreground: [{ pid: 10, name: "bash.exe" }] }),
     descendants: (root: number) => (root === 10 ? [] : [pi]),
+    processes: () => [],
   };
   assert.equal(probePanePiProcess("w1:p2", { sessionFile: session }, "win32", staleShell).ok, true);
+});
+
+test("finds the child by the pid it recorded, even without a usable pane tree", () => {
+  const recorded = process.pid;
+  const result = probePanePiProcess(
+    "w1:p2",
+    { sessionFile: session, pid: recorded },
+    "win32",
+    {
+      paneProcessInfo: () => ({ roots: [10], foreground: [] }),
+      descendants: () => [],
+      processes: () => [{
+        pid: recorded,
+        name: "pi-bolt.exe",
+        cmdline: `pi-bolt.exe --session "C:/test dir/session.jsonl"`,
+      }],
+    },
+  );
+  assert.equal(result.ok, true);
+});
+
+test("a recorded pid from another session or a dead process is refused", () => {
+  const base = {
+    paneProcessInfo: () => ({ roots: [10], foreground: [] }),
+    descendants: () => [],
+  };
+  const otherSession = probePanePiProcess("w1:p2", { sessionFile: session, pid: 20 }, "win32", {
+    ...base,
+    processes: () => [{ pid: 20, name: "pi-bolt.exe", cmdline: "pi-bolt.exe --session C:/other.jsonl" }],
+  });
+  assert.equal(otherSession.ok, false);
+  if (!otherSession.ok) assert.equal(otherSession.reason, "session_mismatch");
+
+  const dead = probePanePiProcess("w1:p2", { sessionFile: session, pid: 20 }, "win32", {
+    ...base,
+    processes: () => [],
+  });
+  assert.equal(dead.ok, false);
+  if (!dead.ok) assert.equal(dead.reason, "pane_gone");
 });
 
 test("a shell, a vanished pane, or ambiguous child identities refuse input", () => {

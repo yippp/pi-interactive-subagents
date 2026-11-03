@@ -39,6 +39,8 @@ export interface SubagentActivityState {
   activeSince?: number;
   waitingSince?: number;
   turnIndex?: number;
+  /** OS process id of the subagent's own pi process, written by the child. */
+  pid?: number;
   messageEventType?: string;
   toolCallId?: string;
   toolName?: string;
@@ -319,6 +321,9 @@ export function createSubagentActivityRecorder(params: {
     turnActive: false,
     providerActive: false,
     toolActive: false,
+    // The child's own pid is the most direct proof that a live Pi process
+    // belongs to this run; the parent verifies it before typing into its pane.
+    pid: process.pid,
   };
 
   let disabled = false;
