@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, basename, isAbsolute, join, resolve, sep, win32 } from "node:path";
+import { fileURLToPath } from "node:url";
 import extension, { __test__ as api } from "../pi-extension/subagents/index.ts";
 import { shellEscape } from "../pi-extension/subagents/herdr.ts";
 import {
@@ -752,4 +753,26 @@ it("normalizes an MSYS PI_CODING_AGENT_DIR to the real agent directory", async (
       else process.env.PI_CODING_AGENT_DIR = previous;
     }
   });
+});
+
+// ── Extracted path module ───────────────────────────────────────────────────
+
+it("keeps paths.ts free of extension imports and re-exported by index.ts", async () => {
+  // paths.ts must stay importable on its own: a single extension import would
+  // reintroduce the cycle the extraction removed.
+  const source = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "..", "pi-extension", "subagents", "paths.ts"),
+    "utf8",
+  );
+  const imports = [...source.matchAll(/from\s+"([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(imports.sort(), ["node:fs", "node:os", "node:path", "node:url"]);
+
+  const paths = await import("../pi-extension/subagents/paths.ts");
+  // Same behaviour through both entry points: the index re-export is not a copy.
+  assert.equal(paths.normalizePiPath, api.normalizePiPath);
+  assert.equal(paths.normalizeWindowsShellPath, api.normalizeWindowsShellPath);
+  assert.equal(paths.resolvePiPath, api.resolvePiPath);
+  assert.equal(paths.defaultSessionDirPath, api.defaultSessionDirPath);
+  assert.equal(paths.samePath, api.samePath);
+  assert.equal(paths.resolveChildSessionDir, api.resolveChildSessionDir);
 });

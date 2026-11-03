@@ -187,8 +187,15 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
-    const tools = pi.getAllTools();
-    toolNames = tools.map((t) => t.name).sort();
+    // getActiveTools() is the set declared to the model, i.e. what the child
+    // can actually call after --tools filtering. getAllTools() also lists
+    // registered-but-inactive tools (disabled, excluded, or codemode-only),
+    // which made the widget advertise tools the child does not have.
+    // A host without getActiveTools falls back to getAllTools.
+    const active = typeof pi.getActiveTools === "function" ? pi.getActiveTools() : null;
+    toolNames = active
+      ? [...active].sort()
+      : pi.getAllTools().map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);

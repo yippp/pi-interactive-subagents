@@ -86,6 +86,15 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   other providers.
 - Windows cwd — `resolveSubagentPaths` uses `isAbsolute()` instead of
   `startsWith("/")`, so a `G:\repo` cwd is not joined onto the parent cwd.
+- Path helpers — pi's path normalization (`normalizeWindowsShellPath`,
+  `normalizePiPath`, `resolvePiPath`), the child session-directory choice
+  (`defaultSessionDirPath`, `samePath`, `resolveChildSessionDir`), and
+  `canonicalizePath` live in `paths.ts`. `index.ts` imports them and re-exports
+  the three public normalizers, so existing importers keep working; the
+  `__test__` surface is unchanged. `paths.ts` imports only Node built-ins, so it
+  cannot form a cycle with `index.ts`, `herdr.ts`, or `session.ts`. Behaviour is
+  unchanged — the move only removed the duplicated bodies from the 3.7k-line
+  `index.ts`.
 - Windows hc (Core) launch — `herdr-desktop.ts` used a bare `bash`, which
   herdr-core resolves against the Windows registry PATH (often without Git's
   bin directory), so `hc run` failed with `cannot start bash: not found on
@@ -112,6 +121,12 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   discoverable agents and silently empty agent defaults.
 - `/subagent-doctor` — prints each agent's allowlist, resolved extension paths,
   provider-extension status, and Herdr availability without a model call.
+- The sub-agent tools widget lists `getActiveTools()`, not `getAllTools()`. The
+  former is the set declared to the model after `--tools` filtering; the latter
+  also contains registered-but-inactive tools, so the widget used to advertise
+  tools the child could not call. A host without `getActiveTools` falls back to
+  `getAllTools`. `test/test.ts` covers both branches, the collapsed and
+  expanded renderings, and fails if the active list is ignored.
 
 ## Behavior changes to review
 
@@ -147,10 +162,14 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 241 tests, 241 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 252 tests, 252 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
-  works if `PI_SUBAGENT_ALLOWED` is unset.
+  works if `PI_SUBAGENT_ALLOWED` is unset. `test/system-prompt-mode.test.ts`
+  is part of the suite: it now loads agents through `loadAgentDefaults` and
+  builds CLI flags through `applySandboxToParts`, so the frontmatter field and
+  its two delivery flags are covered by shipped code instead of a local copy
+  of the logic.
 - Added tests: `test/join.test.ts` (all/any, timeout, abort, question, blocked,
   stale generation, reset), `test/pi-bolt.test.ts` (read-only default,
   legacy snapshot refusal, provenance for pi-web-access tool names, bundled
@@ -217,11 +236,22 @@ no per-server isolation for MCP.
    session tree. A further real Pi-Bolt/model task on commit `08e0f24`
    verified a relative session directory and a cross-project `/c/...` cwd,
    result delivery, and an in-flight wait. GUI layout remains unverified.
-2. Live Herdr TUI spawn/resume and desktop resume remain unverified.
-4. `getAllTools().sourceInfo` was exercised through a mocked extension API.
-   The installed pi-web-access package does register `fetch_content`,
-   `get_search_content`, and `source_check`, but a live parent was not queried.
-   Run `/subagent-doctor` in the target session to confirm the real paths.
+2. Herdr TUI spawn is verified, TUI resume is not. A real Pi-Bolt parent and
+   child ran in an isolated Herdr 0.9.5 server (named session, lab XDG dirs)
+   with the default shell set to Git Bash: the fork created the surface, the
+   child completed a model call, the completion steer arrived, and an in-flight
+   `subagent_wait` blocked ~40 s before returning `completed`. The server also
+   reported the child pane's agent as `pi-bolt`, and the child session stayed
+   in the parent's `--session-dir`. The user's live server, socket, and layout
+   were unchanged. Herdr TUI resume and desktop resume remain unverified, as
+   does the TUI client's own rendering and focus behaviour.
+3. `/subagent-doctor` was run in a live Pi-Bolt session and printed real
+   extension paths resolved through `getAllTools().sourceInfo`: pi-web-access
+   (`web_search`, `fetch_content`, `get_search_content`, `source_check` →
+   `…/pi-web-access/dist/index.js`), this package's spawning tools and
+   `subagent-done.ts`, and `antigravity-acp` →
+   `…/pi-antigravity-acp-provider/extensions/index.ts`. The earlier
+   `getAllTools` mock coverage is superseded by this live run.
 5. The provider extension path was tested with a temporary fixture matching the
    real npm layout, not with a live `antigravity-acp/*` model call.
 6. The retry loop is covered with injected dependencies, not a real provider
@@ -239,13 +269,13 @@ no per-server isolation for MCP.
 9. Native Windows cwd, a Git Bash `/c/...` cwd, and both absolute and relative
    custom session-directory placement were exercised in headless Core; live
    resume/fork across cwd remains unverified.
-11. Only `antigravity-acp` and the upstream Anthropic auth extension have
+10. Only `antigravity-acp` and the upstream Anthropic auth extension have
     provider mappings. Other extension-provided providers need an entry or
     `registerProviderExtension`.
-12. The fork/lineage summary baseline is tested at the `summarizeAttempt`
+11. The fork/lineage summary baseline is tested at the `summarizeAttempt`
     level, not by spawning a real seeded fork session. Verify with a live fork
     run before relying on the last-message summary.
-13. Omitted-model resolution follows pi's trust order but cannot run project
+12. Omitted-model resolution follows pi's trust order but cannot run project
     extension `project_trust` handlers: a project `.pi/extensions` directory
     fails closed. With no project settings file no trust gate is applied. When
     one exists, explicit trust-store decisions win; `always`/`never` are

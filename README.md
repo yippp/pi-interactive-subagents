@@ -96,7 +96,9 @@ follow the stored session file path.
 
 Run `/subagent-doctor` to print each agent's resolved allowlist and extension
 paths, provider-extension status, and Herdr availability. It does not call a
-model.
+model. In a live Pi-Bolt session it resolved pi-web-access's tools to the
+installed `dist/index.js`, this package's tools to its own files, and
+`antigravity-acp` to `pi-antigravity-acp-provider/extensions/index.ts`.
 
 ## Tools
 
@@ -239,7 +241,7 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 ## Status widget & configuration
 
-The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
+The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — it lists the tools the child can actually call (its active set after `--tools` filtering), not every registered tool — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
 Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
 

@@ -1711,6 +1711,122 @@ describe("subagent-done.ts", () => {
     });
   });
 
+  describe("tools widget", () => {
+    // The widget used to list getAllTools(), which also contains tools the
+    // child cannot call (disabled by --tools, excluded, or codemode-only).
+    // Show only what the model actually has.
+    function setupWidgetExtension(opts: {
+      active?: string[] | undefined;
+      all: Array<{ name: string }>;
+    }) {
+      const handlers = new Map<string, Array<(...args: any[]) => void>>();
+      const widgets = new Map<string, any>();
+      const shortcuts = new Map<string, any>();
+      const api: any = {
+        on(event: string, handler: (...args: any[]) => void) {
+          if (!handlers.has(event)) handlers.set(event, []);
+          handlers.get(event)!.push(handler);
+        },
+        registerTool() {},
+        registerCommand() {},
+        registerMessageRenderer() {},
+        registerShortcut(key: string, shortcut: any) { shortcuts.set(key, shortcut); },
+        sendUserMessage() {},
+        sendMessage() {},
+        getAllTools: () => opts.all,
+      };
+      if (opts.active !== undefined) api.getActiveTools = () => opts.active;
+
+      const saved = {
+        session: process.env.PI_SUBAGENT_SESSION,
+        name: process.env.PI_SUBAGENT_NAME,
+        agent: process.env.PI_SUBAGENT_AGENT,
+        autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+      };
+      process.env.PI_SUBAGENT_SESSION = join(tmpdir(), "widget-test-session.jsonl");
+      process.env.PI_SUBAGENT_NAME = "widget-test";
+      process.env.PI_SUBAGENT_AGENT = "scout";
+      delete process.env.PI_SUBAGENT_AUTO_EXIT;
+      subagentDoneExtension(api);
+
+      const ctx = {
+        ui: {
+          setWidget(key: string, factory: any) {
+            widgets.set(key, factory);
+          },
+        },
+      };
+      (handlers.get("session_start") ?? []).forEach((h) => h({}, ctx));
+
+      const restore = () => {
+        restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
+        restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
+        restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+      };
+
+      const render = (expanded = false) => {
+        // Ctrl+Alt+O toggles the full list; the collapsed form is a count only.
+        const toggle = shortcuts.get("ctrl+alt+o");
+        assert.ok(toggle, "expected the expand shortcut to be registered");
+        if (expanded) toggle.handler(ctx);
+        const factory = widgets.get("subagent-tools");
+        assert.ok(factory, "expected the tools widget to be registered");
+        const theme = {
+          fg(_color: string, text: string) { return text; },
+          bg(_color: string, text: string) { return text; },
+          bold(text: string) { return text; },
+        };
+        return factory({}, theme).render(80).join("\n");
+      };
+
+      return { render, restore };
+    }
+
+    it("lists only active tools, not every registered tool", () => {
+      const { render, restore } = setupWidgetExtension({
+        active: ["ask_question", "read"],
+        all: [{ name: "ask_question" }, { name: "read" }, { name: "bash" }, { name: "subagent" }],
+      });
+      try {
+        const output = render(true);
+        assert.match(output, /2 available/, "expected the active count");
+        assert.match(output, /ask_question/);
+        assert.match(output, /read/);
+        assert.doesNotMatch(output, /bash/, "inactive tools must not be advertised");
+        assert.doesNotMatch(output, /subagent/);
+      } finally {
+        restore();
+      }
+    });
+
+    it("falls back to getAllTools when the host has no getActiveTools", () => {
+      const { render, restore } = setupWidgetExtension({
+        active: undefined,
+        all: [{ name: "ask_question" }, { name: "read" }],
+      });
+      try {
+        const output = render(true);
+        assert.match(output, /2 available/);
+        assert.match(output, /ask_question/);
+        assert.match(output, /read/);
+      } finally {
+        restore();
+      }
+    });
+
+    it("shows an empty list when the session has no active tools", () => {
+      const { render, restore } = setupWidgetExtension({ active: [], all: [{ name: "bash" }] });
+      try {
+        const output = render(true);
+        assert.match(output, /0 available/);
+        assert.doesNotMatch(output, /bash/);
+      } finally {
+        restore();
+      }
+    });
+  });
+
   describe("ask_question tool", () => {
     function setupSubagentExtension(sessionFile: string) {
       const saved = {

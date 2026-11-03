@@ -1,163 +1,135 @@
 /**
- * Smoke tests for the systemPromptMode feature.
- * Tests: frontmatter parsing, identity routing, CLI flag generation.
+ * Regression tests for the `system-prompt` frontmatter field.
+ *
+ * The field decides where an agent's identity text is delivered:
+ * - `append` / `replace` → written to a file and passed as
+ *   `--append-system-prompt` / `--system-prompt`.
+ * - omitted or invalid → the body is prepended to the task prompt instead.
+ *
+ * These tests call the shipped code (`parseAgentDefinition` through
+ * `loadAgentDefaults`, and `applySandboxToParts` for the CLI flags) rather than
+ * a local re-implementation, so a change in the parser or the sandbox builder
+ * fails here.
  */
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { __test__ as api } from "../pi-extension/subagents/index.ts";
 
-let passed = 0;
-let failed = 0;
+function agentFile(frontmatter: string, body = "You are a specialized agent."): string {
+  return `---\n${frontmatter}\n---\n\n${body}\n`;
+}
 
-function assert(condition: boolean, msg: string) {
-  if (condition) {
-    console.log(`  ✅ ${msg}`);
-    passed++;
-  } else {
-    console.log(`  ❌ ${msg}`);
-    failed++;
+/**
+ * Load one agent file through the real loader.
+ *
+ * `loadAgentDefaults` searches the project dir, then the global agent dir, then
+ * the bundled agents, so the fixture goes into an isolated global agent dir.
+ */
+function loadAgent(frontmatter: string, body?: string): any {
+  const dir = mkdtempSync(join(tmpdir(), "pi-test-spm-"));
+  const agentsDir = join(dir, "agents");
+  mkdirSync(agentsDir, { recursive: true });
+  writeFileSync(join(agentsDir, "spm-test.md"), agentFile(frontmatter, body));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  try {
+    return api.loadAgentDefaults("spm-test");
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
-// --- Extracted logic under test ---
-
-function parseFrontmatter(content: string) {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return null;
-  const frontmatter = match[1];
-  const get = (key: string) => {
-    const m = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-    return m ? m[1].trim() : undefined;
-  };
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-  const spm = get("system-prompt");
-  return {
-    systemPromptMode: spm === "replace" ? "replace" : spm === "append" ? "append" : undefined,
-    body: body || undefined,
-  };
-}
-
-function simulateRouting(
-  agentBody: string | undefined,
-  systemPromptMode: "append" | "replace" | undefined,
-  paramSystemPrompt: string | undefined,
-) {
-  const identity = agentBody ?? paramSystemPrompt ?? null;
-  const identityInSystemPrompt = systemPromptMode && identity;
-  const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
-
-  let cliFlag: string | null = null;
-  if (identityInSystemPrompt && identity) {
-    cliFlag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
+/** Build the sandbox parts for a loadout with the given identity mode. */
+function withSandboxParts(
+  loadout: Record<string, unknown>,
+  run: (parts: string[]) => void,
+): void {
+  const dir = mkdtempSync(join(tmpdir(), "pi-test-spm-sandbox-"));
+  try {
+    const parts: string[] = [];
+    api.applySandboxToParts(
+      parts,
+      {
+        agent: "spm-test",
+        toolAllowlist: "read",
+        model: "anthropic/test-model",
+        thinking: null,
+        systemPromptMode: null,
+        identity: null,
+        spawnable: null,
+        autoExit: true,
+        cwd: null,
+        agentDir: null,
+        ...loadout,
+      },
+      { artifactDir: dir, name: "spm-test" },
+    );
+    run(parts);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
-
-  return { roleBlock, cliFlag, identityInSystemPrompt: !!identityInSystemPrompt };
 }
 
-// --- Fixtures ---
+describe("system-prompt frontmatter", () => {
+  it("reads replace and append, and ignores anything else", () => {
+    assert.equal(loadAgent("system-prompt: replace")?.systemPromptMode, "replace");
+    assert.equal(loadAgent("system-prompt: append")?.systemPromptMode, "append");
+    assert.equal(loadAgent("model: anthropic/test-model")?.systemPromptMode, undefined);
+    assert.equal(loadAgent("system-prompt: foobar")?.systemPromptMode, undefined);
+  });
 
-const AGENT_REPLACE = `---
-model: anthropic/claude-sonnet-4-20250514
-system-prompt: replace
-auto-exit: true
----
+  it("keeps the agent body available for the task-prompt fallback", () => {
+    const loaded = loadAgent("system-prompt: replace", "You are a specialized agent.");
+    assert.equal(loaded?.body, "You are a specialized agent.");
+  });
+});
 
-You are a specialized agent.`;
+describe("system-prompt delivery", () => {
+  it("replace mode writes the identity file and passes --system-prompt", () => {
+    withSandboxParts({ systemPromptMode: "replace", identity: "You are X." }, (parts) => {
+      assert.ok(parts.includes("--system-prompt"), "expected --system-prompt");
+      assert.ok(!parts.includes("--append-system-prompt"));
 
-const AGENT_APPEND = `---
-model: anthropic/claude-sonnet-4-20250514
-system-prompt: append
----
+      const file = parts[parts.indexOf("--system-prompt") + 1].replace(/^'|'$/g, "");
+      assert.ok(existsSync(file), `expected the identity file to exist: ${file}`);
+      assert.equal(readFileSync(file, "utf8"), "You are X.");
+    });
+  });
 
-You are an appended identity.`;
+  it("append mode passes --append-system-prompt", () => {
+    withSandboxParts({ systemPromptMode: "append", identity: "You are X." }, (parts) => {
+      assert.ok(parts.includes("--append-system-prompt"));
+      assert.ok(!parts.includes("--system-prompt"));
+    });
+  });
 
-const AGENT_DEFAULT = `---
-model: anthropic/claude-sonnet-4-20250514
----
+  it("treats a null mode with an identity as append (resume compatibility)", () => {
+    // Older loadouts recorded the identity without a mode; they must still
+    // deliver it as an appended system prompt rather than silently dropping it.
+    withSandboxParts({ systemPromptMode: null, identity: "You are X." }, (parts) => {
+      assert.ok(parts.includes("--append-system-prompt"));
+    });
+  });
 
-You are a default agent.`;
+  it("adds no system-prompt flag when the identity is null", () => {
+    withSandboxParts({ systemPromptMode: "replace", identity: null }, (parts) => {
+      assert.ok(!parts.includes("--system-prompt"));
+      assert.ok(!parts.includes("--append-system-prompt"));
+    });
+  });
+});
 
-const AGENT_INVALID = `---
-model: anthropic/claude-sonnet-4-20250514
-system-prompt: foobar
----
-
-Body here.`;
-
-// --- Test 1: Frontmatter parsing ---
-console.log("\n🧪 Frontmatter parsing of system-prompt field");
-
-const r1 = parseFrontmatter(AGENT_REPLACE)!;
-assert(r1.systemPromptMode === "replace", "system-prompt: replace → mode is 'replace'");
-assert(r1.body === "You are a specialized agent.", "body extracted correctly");
-
-const r2 = parseFrontmatter(AGENT_APPEND)!;
-assert(r2.systemPromptMode === "append", "system-prompt: append → mode is 'append'");
-
-const r3 = parseFrontmatter(AGENT_DEFAULT)!;
-assert(r3.systemPromptMode === undefined, "no system-prompt field → mode is undefined");
-
-const r4 = parseFrontmatter(AGENT_INVALID)!;
-assert(r4.systemPromptMode === undefined, "system-prompt: foobar → mode is undefined (ignored)");
-
-// --- Test 2: Identity routing ---
-console.log("\n🧪 Identity routing (system prompt vs user message)");
-
-const s1 = simulateRouting("You are X.", "replace", undefined);
-assert(s1.roleBlock === "", "replace mode: roleBlock empty (not in task)");
-assert(s1.cliFlag === "--system-prompt", "replace mode: uses --system-prompt flag");
-
-const s2 = simulateRouting("You are X.", "append", undefined);
-assert(s2.roleBlock === "", "append mode: roleBlock empty (not in task)");
-assert(s2.cliFlag === "--append-system-prompt", "append mode: uses --append-system-prompt flag");
-
-const s3 = simulateRouting("You are X.", undefined, undefined);
-assert(s3.roleBlock === "\n\nYou are X.", "no mode: roleBlock contains identity");
-assert(s3.cliFlag === null, "no mode: no CLI flag");
-
-const s4 = simulateRouting(undefined, undefined, undefined);
-assert(s4.roleBlock === "", "no identity: roleBlock empty");
-assert(s4.cliFlag === null, "no identity: no CLI flag");
-
-const s5 = simulateRouting(undefined, "replace", undefined);
-assert(s5.roleBlock === "", "mode set but no body: roleBlock empty");
-assert(s5.cliFlag === null, "mode set but no body: no CLI flag");
-
-const s6 = simulateRouting(undefined, "replace", "Param identity");
-assert(s6.cliFlag === "--system-prompt", "mode + param systemPrompt: uses CLI flag");
-assert(s6.roleBlock === "", "mode + param systemPrompt: roleBlock empty");
-
-// --- Test 3: End-to-end with temp agent files ---
-console.log("\n🧪 End-to-end with temp agent files");
-
-const tmpDir = mkdtempSync(join(tmpdir(), "pi-test-spm-"));
-const agentsDir = join(tmpDir, ".pi", "agents");
-mkdirSync(agentsDir, { recursive: true });
-
-writeFileSync(join(agentsDir, "test-replace.md"), AGENT_REPLACE);
-writeFileSync(join(agentsDir, "test-append.md"), AGENT_APPEND);
-writeFileSync(join(agentsDir, "test-default.md"), AGENT_DEFAULT);
-
-function loadFromDir(name: string) {
-  const p = join(agentsDir, `${name}.md`);
-  if (!existsSync(p)) return null;
-  return parseFrontmatter(readFileSync(p, "utf8"));
-}
-
-const t1 = loadFromDir("test-replace")!;
-assert(t1.systemPromptMode === "replace", "file test-replace.md → replace mode");
-assert(t1.body === "You are a specialized agent.", "file test-replace.md → body correct");
-
-const t2 = loadFromDir("test-append")!;
-assert(t2.systemPromptMode === "append", "file test-append.md → append mode");
-
-const t3 = loadFromDir("test-default")!;
-assert(t3.systemPromptMode === undefined, "file test-default.md → no mode");
-
-rmSync(tmpDir, { recursive: true });
-
-// --- Summary ---
-console.log(`\n${"=".repeat(40)}`);
-console.log(`Results: ${passed} passed, ${failed} failed`);
-if (failed > 0) process.exit(1);
-console.log("All tests passed! ✅\n");
+describe("bundled agents", () => {
+  it("declare append mode so their body is not duplicated into the task", () => {
+    for (const name of ["scout", "researcher", "worker"]) {
+      const loaded = api.loadAgentDefaults(name);
+      assert.ok(loaded, `expected bundled agent ${name} to be discoverable`);
+      assert.equal(loaded.systemPromptMode, "append", `${name} should use system-prompt: append`);
+    }
+  });
+});
