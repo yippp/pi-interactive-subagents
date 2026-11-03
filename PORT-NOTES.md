@@ -162,7 +162,7 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 253 tests, 253 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 306 tests, 306 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
   works if `PI_SUBAGENT_ALLOWED` is unset. `test/system-prompt-mode.test.ts`
@@ -184,6 +184,16 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   explicit deny/never global fallback, project extensions and unreadable trust
   store fail-closed, out-of-scope enabledModels/missing defaults, provider
   prefix handling, and refusal of null-model snapshots).
+- Real Pi-Bolt steering validation (isolated Herdr 0.9.5, Git Bash default
+  shell): a follow-up sent while the child ran changed its final answer
+  (`INITIAL_ONLY` → `CORRECTED_OK`), and a child that asked a question received
+  the reply and answered `QUESTION_OK`. A closed pane ended the watcher without
+  a provider retry. `subagent_message` falls back to typing into the pane only
+  for `agent_not_ready`/`agent_not_found`, and only after the child's recorded
+  pid is proven alive with this run's `--session` file; `agent_blocked`,
+  timeouts, and generic prompt failures never fall back. The pid proof was
+  checked against a real child in an isolated pane: live child accepted, wrong
+  session and dead pid refused.
 - Child session placement tests cover an explicit lab `--session-dir`
   (including a cross-project cwd and no default-dir pollution), a relative
   session dir resolved against the parent cwd, canonical cwd normalization
