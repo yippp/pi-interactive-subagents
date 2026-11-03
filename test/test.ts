@@ -2486,13 +2486,13 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("steers a running subagent by typing into its pane (newlines flattened)", () => {
+  it("steers a running subagent by typing into its pane (newlines flattened)", async () => {
     const testApi = (subagentsModule as any).__test__;
     let sentSurface = "";
     let sentText = "";
     const running = makeRunning();
 
-    const result = testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
+    const result = await testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
       sentSurface = surface;
       sentText = text;
     });
@@ -2502,11 +2502,11 @@ describe("subagent interruption", () => {
     assert.equal(sentText, "do this then that");
   });
 
-  it("returns an explicit error when steering delivery fails", () => {
+  it("returns an explicit error when steering delivery fails", async () => {
     const testApi = (subagentsModule as any).__test__;
     const running = makeRunning();
 
-    const result = testApi.steerSubagent(running, "hi", () => {
+    const result = await testApi.steerSubagent(running, "hi", () => {
       throw new Error("mux write failed");
     });
 
@@ -2525,14 +2525,14 @@ describe("subagent interruption", () => {
   const PROOF_OK = { ok: true as const, proof: { pid: 4242, name: "pi-bolt.exe" } };
   const SESSION = "C:/test/sessions/worker.jsonl";
 
-  function runSteer(
+  async function runSteer(
     error: Error,
     probeResult: unknown,
     overrides: Record<string, unknown> = {},
   ) {
     const testApi = (subagentsModule as any).__test__;
     const calls: Array<{ kind: string; surface: string; text: string }> = [];
-    const result = testApi.steerSubagent(
+    const result = await testApi.steerSubagent(
       makeRunning({ sessionFile: SESSION, ...overrides }),
       "keep going\non this",
       () => {
@@ -2542,24 +2542,26 @@ describe("subagent interruption", () => {
       },
       (surface: string, text: string) => calls.push({ kind: "pane", surface, text }),
       () => probeResult,
+      // Refusal cases must not wait out the startup window.
+      { startupWindowMs: 0 },
     );
     return { result, calls };
   }
 
-  it("falls back to typing into the pane after agent_not_ready, with proof", () => {
-    const { result, calls } = runSteer(notReady(), PROOF_OK);
+  it("falls back to typing into the pane after agent_not_ready, with proof", async () => {
+    const { result, calls } = await runSteer(notReady(), PROOF_OK);
     assert.deepEqual(result, { ok: true, delivery: "pane" });
     assert.deepEqual(calls, [{ kind: "pane", surface: "pane-1", text: "keep going on this" }]);
   });
 
-  it("does not use the Pi fallback for Claude processes", () => {
-    const { result, calls } = runSteer(notReady(), PROOF_OK, { cli: "claude" });
+  it("does not use the Pi fallback for Claude processes", async () => {
+    const { result, calls } = await runSteer(notReady(), PROOF_OK, { cli: "claude" });
     assert.match(result.error, /Failed to deliver message/);
     assert.equal(calls.length, 0);
   });
 
-  it("falls back after agent_not_found as well", () => {
-    const { result, calls } = runSteer(
+  it("falls back after agent_not_found as well", async () => {
+    const { result, calls } = await runSteer(
       new HerdrApiError("agent_not_found", "agent target w1:p1 not found"),
       PROOF_OK,
     );
@@ -2569,29 +2571,29 @@ describe("subagent interruption", () => {
   });
 
   for (const code of ["agent_blocked", "timeout", "agent_prompt_failed", "agent_prompt_stalled"]) {
-    it(`never falls back after ${code}`, () => {
-      const { result, calls } = runSteer(new HerdrApiError(code, "refused"), PROOF_OK);
+    it(`never falls back after ${code}`, async () => {
+      const { result, calls } = await runSteer(new HerdrApiError(code, "refused"), PROOF_OK);
       assert.match(result.error, /Failed to deliver message/);
       assert.equal(calls.length, 0, "nothing may be typed into the pane");
     });
   }
 
-  it("does not fall back for a non-Herdr transport failure", () => {
-    const { result, calls } = runSteer(new Error("herdr agent prompt failed: socket closed"), PROOF_OK);
+  it("does not fall back for a non-Herdr transport failure", async () => {
+    const { result, calls } = await runSteer(new Error("herdr agent prompt failed: socket closed"), PROOF_OK);
     assert.match(result.error, /Failed to deliver message/);
     assert.equal(calls.length, 0);
   });
 
   for (const reason of ["shell_only", "pane_gone", "no_child", "session_mismatch", "ambiguous", "probe_unavailable"]) {
-    it(`refuses the fallback when the probe reports ${reason}`, () => {
-      const { result, calls } = runSteer(notReady(), { ok: false, reason, detail: "probe detail" });
+    it(`refuses the fallback when the probe reports ${reason}`, async () => {
+      const { result, calls } = await runSteer(notReady(), { ok: false, reason, detail: "probe detail" });
       assert.match(result.error, /agent_not_ready/);
       assert.match(result.error, /The message was not delivered/);
       assert.equal(calls.length, 0, "an unproven pane must not receive the text");
     });
   }
 
-  it("explains each refusal reason in plain words", () => {
+  it("explains each refusal reason in plain words", async () => {
     const cases: Array<[string, RegExp]> = [
       ["shell_only", /only a shell/],
       ["pane_gone", /pane is gone/],
@@ -2600,14 +2602,77 @@ describe("subagent interruption", () => {
       ["ambiguous", /several Pi processes/],
     ];
     for (const [reason, expected] of cases) {
-      const { result } = runSteer(notReady(), { ok: false, reason, detail: "d" });
+      const { result } = await runSteer(notReady(), { ok: false, reason, detail: "d" });
       assert.match(result.error, expected, `expected ${reason} to be explained`);
     }
   });
 
-  it("reports a failed pane write after a successful probe", () => {
+  it("waits out a still-booting child, then types once proved", async () => {
     const testApi = (subagentsModule as any).__test__;
-    const result = testApi.steerSubagent(
+    const calls: Array<{ surface: string; text: string }> = [];
+    let probes = 0;
+    const result = await testApi.steerSubagent(
+      makeRunning({ sessionFile: SESSION }),
+      "go",
+      () => {
+        throw notReady();
+      },
+      (surface: string, text: string) => calls.push({ surface, text }),
+      () => (++probes === 1 ? { ok: false, reason: "no_child", detail: "booting" } : PROOF_OK),
+      { startupWindowMs: 5_000, sleep: async () => {} },
+    );
+    assert.deepEqual(result, { ok: true, delivery: "pane" });
+    assert.equal(probes, 2, "the probe is retried while the child boots");
+    assert.deepEqual(calls, [{ surface: "pane-1", text: "go" }]);
+  });
+
+  it("does not retry a probe that already showed the pane is gone", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const calls: unknown[] = [];
+    let probes = 0;
+    const result = await testApi.steerSubagent(
+      makeRunning({ sessionFile: SESSION }),
+      "go",
+      () => {
+        throw notReady();
+      },
+      (surface: string, text: string) => calls.push({ surface, text }),
+      () => {
+        probes += 1;
+        return { ok: false, reason: "pane_gone", detail: "gone" };
+      },
+      { startupWindowMs: 5_000, sleep: async () => {} },
+    );
+    assert.equal(probes, 1, "a vanished pane is never retried");
+    assert.match(result.error, /pane is gone/);
+    assert.equal(calls.length, 0);
+  });
+
+  it("stops retrying after the startup window without typing", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const calls: unknown[] = [];
+    let probes = 0;
+    const result = await testApi.steerSubagent(
+      makeRunning({ sessionFile: SESSION }),
+      "go",
+      () => {
+        throw notReady();
+      },
+      (surface: string, text: string) => calls.push({ surface, text }),
+      () => {
+        probes += 1;
+        return { ok: false, reason: "shell_only", detail: "still a shell" };
+      },
+      { startupWindowMs: 0, sleep: async () => {} },
+    );
+    assert.equal(probes, 1);
+    assert.match(result.error, /only a shell/);
+    assert.equal(calls.length, 0);
+  });
+
+  it("reports a failed pane write after a successful probe", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const result = await testApi.steerSubagent(
       makeRunning({ sessionFile: SESSION }),
       "go",
       () => {
@@ -2617,24 +2682,26 @@ describe("subagent interruption", () => {
         throw new Error("pane run failed");
       },
       () => PROOF_OK,
+      { startupWindowMs: 0 },
     );
     assert.match(result.error, /agent_not_ready/);
     assert.match(result.error, /pane run failed/);
   });
 
-  it("passes the delivery kind through the tool result", () => {
+  it("passes the delivery kind through the tool result", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
     try {
       runningMap.set("a1", makeRunning({ sessionFile: SESSION }));
-      const result = testApi.handleSubagentSteer(
+      const result = await testApi.handleSubagentSteer(
         { name: "Worker", message: "go" },
         () => {
           throw notReady();
         },
         () => {},
         () => PROOF_OK,
+        { startupWindowMs: 0 },
       );
       assert.equal(result.details.status, "steered");
       assert.equal(result.details.delivery, "pane");
@@ -2643,7 +2710,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("delivers a steer message and forces local status waiting", () => {
+  it("delivers a steer message and forces local status waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -2668,7 +2735,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
+      const result = await withMockedNow(20_000, () =>
         testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
           sentSurface = surface;
           sentText = text;
@@ -2687,20 +2754,20 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("requires a message when steering", () => {
+  it("requires a message when steering", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
     try {
       runningMap.set("a1", makeRunning());
-      const result = testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
+      const result = await testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
       assert.match(result.content[0].text, /`message` is required/);
     } finally {
       runningMap.clear();
     }
   });
 
-  it("leaves status unchanged when steering delivery fails in the tool path", () => {
+  it("leaves status unchanged when steering delivery fails in the tool path", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -2723,7 +2790,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
+      const result = await withMockedNow(20_000, () =>
         testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
           throw new Error("mux write failed");
         }),

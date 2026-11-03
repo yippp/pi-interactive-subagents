@@ -1647,6 +1647,24 @@ function resolveRunningByName(name: string):
 const AGENT_UNRECOGNISED_CODES = new Set(["agent_not_ready", "agent_not_found"]);
 
 /**
+ * Probe reasons that mean "the child is not visible yet", not "this is the
+ * wrong pane". A freshly spawned child spends a moment in its launch script
+ * before Pi starts, so an early follow-up would otherwise be refused and lost.
+ */
+const CHILD_NOT_STARTED_REASONS = new Set<PanePiProbeFailure>(["shell_only", "no_child"]);
+
+const PROBE_RETRY_INTERVAL_MS = 500;
+const DEFAULT_STARTUP_PROBE_MS = 15_000;
+
+/** How long to wait for a starting child to become verifiable. `0` disables. */
+function startupProbeWindowMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.PI_SUBAGENT_STARTUP_PROBE_MS?.trim();
+  if (raw === "0") return 0;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_STARTUP_PROBE_MS;
+}
+
+/**
  * Type a follow-up message into a running subagent's live pane. Newlines are
  * collapsed to spaces because each newline submits a turn in the child's TUI
  * editor; a multi-line message would otherwise fire as several partial turns.
@@ -1664,13 +1682,14 @@ const AGENT_UNRECOGNISED_CODES = new Set(["agent_not_ready", "agent_not_found"])
  * session file (`probePanePiProcess`); anything unproven stays an error rather
  * than risking the text being executed as a shell command.
  */
-function steerSubagent(
+async function steerSubagent(
   running: RunningSubagent,
   message: string,
   send: (surface: string, command: string) => void = sendMessage,
   deliverToPane: (surface: string, message: string) => void = sendPaneText,
   probe: typeof probePanePiProcess = probePanePiProcess,
-): { ok: true; delivery?: "agent" | "pane" } | { error: string } {
+  options: { startupWindowMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<{ ok: true; delivery?: "agent" | "pane" } | { error: string }> {
   if (running.retrying) {
     return {
       error:
@@ -1693,7 +1712,18 @@ function steerSubagent(
     return { error: steerFailureMessage(running, firstError) };
   }
 
-  const probeResult = probe(running.surface, { sessionFile: running.sessionFile });
+  const startupWindowMs = options.startupWindowMs ?? startupProbeWindowMs();
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let probeResult = probe(running.surface, { sessionFile: running.sessionFile });
+  if (!probeResult.ok && CHILD_NOT_STARTED_REASONS.has(probeResult.reason) && startupWindowMs > 0) {
+    // Bounded wait for a child that is still booting. Safety is unchanged: the
+    // text is typed only after the same positive proof succeeds.
+    const deadline = Date.now() + startupWindowMs;
+    while (!probeResult.ok && CHILD_NOT_STARTED_REASONS.has(probeResult.reason) && Date.now() < deadline) {
+      await sleep(PROBE_RETRY_INTERVAL_MS);
+      probeResult = probe(running.surface, { sessionFile: running.sessionFile });
+    }
+  }
   if (!probeResult.ok) {
     return { error: steerFallbackRefusal(running, firstError, probeResult) };
   }
@@ -1744,12 +1774,12 @@ function steerFallbackRefusal(
   );
 }
 
-function handleSubagentSteer(
-  params: { name?: string; message?: string },
-  send: (surface: string, command: string) => void = sendMessage,
+async function handleSubagentSteer(
+  params: { name?: string; message?: string },  send: (surface: string, command: string) => void = sendMessage,
   deliverToPane: (surface: string, message: string) => void = sendPaneText,
   probe: typeof probePanePiProcess = probePanePiProcess,
-) {
+  options: { startupWindowMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<any> {
   const message = params.message?.trim();
   if (!message) {
     const err = "`message` is required to steer a running subagent.";
@@ -1768,7 +1798,7 @@ function handleSubagentSteer(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  const steer = steerSubagent(running, message, send, deliverToPane, probe);
+  const steer = await steerSubagent(running, message, send, deliverToPane, probe, options);
   if ("error" in steer) {
     return {
       content: [{ type: "text" as const, text: steer.error }],
