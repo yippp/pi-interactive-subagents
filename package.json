@@ -9,7 +9,7 @@
   "author": "Amos Blomqvist",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jordyvanvorselen/pi-interactive-subagents.git"
+    "url": "git+https://github.com/yippp/pi-interactive-subagents.git"
   },
   "type": "module",
   "scripts": {

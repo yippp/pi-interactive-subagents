@@ -4,13 +4,19 @@ permissions:
   contents: read
 
 on:
+  push:
+    branches: [pi-bolt-compat]
   pull_request:
-    branches: [main]
+    branches: [main, pi-bolt-compat]
   workflow_call:
 
 jobs:
   unit-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -22,7 +28,7 @@ jobs:
         run: npm test
 
   version-check:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

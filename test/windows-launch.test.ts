@@ -25,12 +25,18 @@ test("Windows pane launch uses the actual shell and quotes paths", () => {
   assert.throws(() => windowsPaneLaunchCommand("unknown", native, posix), /unsupported Herdr pane shell/);
 });
 
-test("Git Bash executes the selected launch command from a path with spaces", { skip: process.platform !== "win32" }, () => {
+test("Git Bash executes the selected launch command from a path with spaces", { skip: process.platform !== "win32" }, (t) => {
+  let bash: string;
+  try {
+    bash = resolveBashStrict();
+  } catch {
+    t.skip("Git Bash is not installed; resolver behavior is covered separately");
+    return;
+  }
   const dir = mkdtempSync(join(tmpdir(), "pi launch space "));
   try {
     const file = join(dir, "agent's task.sh");
     writeFileSync(file, "#!/bin/bash\nprintf '%s' BASH_LAUNCH_OK\n");
-    const bash = resolveBashStrict();
     const posixDir = execFileSync(bash, ["-c", "pwd"], { cwd: dir, encoding: "utf8" }).trim();
     const command = windowsPaneLaunchCommand("bash.exe", file, `${posixDir}/agent's task.sh`);
     assert.equal(execFileSync(bash, ["-c", command], { encoding: "utf8" }), "BASH_LAUNCH_OK");

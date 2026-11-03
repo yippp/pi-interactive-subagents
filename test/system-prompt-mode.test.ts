@@ -28,19 +28,13 @@ function agentFile(frontmatter: string, body = "You are a specialized agent."): 
  *
  * `loadAgentDefaults` searches the project dir, then the global agent dir, then
  * the bundled agents, so the fixture goes into an isolated global agent dir.
- */
-/**
- * Load one agent file through the real loader.
- *
- * `loadAgentDefaults` searches the project dir, then the global agent dir, then
- * the bundled agents, so the fixture goes into an isolated global agent dir.
  * The previous `PI_CODING_AGENT_DIR` is restored afterwards.
  */
-function loadAgent(frontmatter: string, body?: string): any {
+function loadAgent(frontmatter: string, body?: string, lineEnding: "\n" | "\r\n" = "\n"): any {
   const dir = mkdtempSync(join(tmpdir(), "pi-test-spm-"));
   const agentsDir = join(dir, "agents");
   mkdirSync(agentsDir, { recursive: true });
-  writeFileSync(join(agentsDir, "spm-test.md"), agentFile(frontmatter, body));
+  writeFileSync(join(agentsDir, "spm-test.md"), agentFile(frontmatter, body).replace(/\n/g, lineEnding));
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = dir;
   try {
@@ -66,6 +60,8 @@ function withSandboxParts(
         agent: "spm-test",
         toolAllowlist: "read",
         model: "anthropic/test-model",
+        providerExtensions: [],
+        providerAuthExtension: null,
         thinking: null,
         systemPromptMode: null,
         identity: null,
@@ -96,6 +92,13 @@ describe("system-prompt frontmatter", () => {
     assert.equal(append.systemPromptMode, "append");
     assert.equal(unset.systemPromptMode, undefined);
     assert.equal(invalid.systemPromptMode, undefined);
+  });
+
+  it("parses Windows CRLF frontmatter through the real loader", () => {
+    const loaded = loadAgent("system-prompt: append", "Windows agent body.", "\r\n");
+    assert.ok(loaded);
+    assert.equal(loaded.systemPromptMode, "append");
+    assert.equal(loaded.body, "Windows agent body.");
   });
 
   it("keeps the agent body available for the task-prompt fallback", () => {
