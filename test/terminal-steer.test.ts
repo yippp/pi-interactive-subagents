@@ -4,7 +4,7 @@ import { probePanePiProcess, HerdrApiError, __probeTest__ } from "../pi-extensio
 const session = "C:/test dir/session.jsonl";
 const pi = { pid: 20, name: "pi-bolt.exe", cmdline: 'pi-bolt.exe --session "C:\\test dir\\session.jsonl" task' };
 const deps = (rows = [pi]) => ({
-  paneProcessInfo: () => ({ shellPid: 10, foreground: [{ pid: 10, name: "bash.exe" }] }),
+  paneProcessInfo: () => ({ roots: [10], foreground: [{ pid: 10, name: "bash.exe" }] }),
   descendants: () => rows,
 });
 
@@ -15,6 +15,14 @@ test("Windows fallback requires a Pi child with the exact --session argument", (
   const wrong = probePanePiProcess("w1:p2", { sessionFile: "C:/another.jsonl" }, "win32", deps());
   assert.equal(wrong.ok, false);
   if (!wrong.ok) assert.equal(wrong.reason, "session_mismatch");
+});
+
+test("a process started in the pane's foreground job is found even when shell_pid is stale", () => {
+  const staleShell = {
+    paneProcessInfo: () => ({ roots: [10, 11], foreground: [{ pid: 10, name: "bash.exe" }] }),
+    descendants: (root: number) => (root === 10 ? [] : [pi]),
+  };
+  assert.equal(probePanePiProcess("w1:p2", { sessionFile: session }, "win32", staleShell).ok, true);
 });
 
 test("a shell, a vanished pane, or ambiguous child identities refuse input", () => {

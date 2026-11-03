@@ -76,6 +76,32 @@ the same session and a continuation message. Default: 3 extra attempts; set
 so `subagent_message` returns "restarting" instead of opening the same session
 a second time.
 
+A follow-up to a running sub-agent goes through Herdr's `agent prompt`, which
+honours bracketed paste and refuses a blocked dialog. Herdr only accepts that
+call when it recognises the pane's agent, and a Pi-Bolt child reports the
+custom label `pi-bolt`, which Herdr 0.9.5 does not know. In that one case — a
+rejection before anything was written — the message is typed into the pane,
+which is how this extension delivered follow-ups before the agent surface
+existed. Typing requires positive proof that this run's Pi process is alive in
+that pane and runs its session file; a pane that only holds a shell, a
+restarted or foreign session, or an unreadable process table is refused with an
+explanation instead. A child that is still booting is given a short bounded
+window before the refusal:
+
+```bash
+export PI_SUBAGENT_STARTUP_PROBE_MS=15000   # default: 15000, 0 disables
+```
+
+An `agent_blocked`, timeout, or generic prompt failure never falls back:
+those may already own the input, so the message stays undelivered rather than
+typed over a dialog or delivered twice. There is still a gap between the proof
+and the write; it is narrow, not closed.
+
+If a pane or terminal disappears before the child reports its exit (for example
+you close its tab), the run ends as `surface_lost`. It is reported as a stopped
+run, not a provider failure, so it is not retried; the session file is kept for
+`subagent_message` to resume.
+
 MCP tools (`mcp__*`) cannot be granted to a restricted child. `builtin:mcp` is a
 gateway: loading it with `-e` connects every enabled MCP server and may expose
 their names and capabilities to the child; per-tool isolation is not verified.

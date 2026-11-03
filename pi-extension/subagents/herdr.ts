@@ -720,10 +720,15 @@ function powerShellCommand(): string {
   return "pwsh";
 }
 
-/** The pane's shell pid, plus the processes Herdr already sees as foreground. */
-function paneProcessInfo(surface: string): { shellPid: number | null; foreground: PaneProcess[] } {
+/** The pane's shell pid and foreground process group: both are tree roots. */
+function paneProcessInfo(surface: string): { roots: number[]; foreground: PaneProcess[] } {
   const info = herdrJson(["pane", "process-info", "--pane", surface])?.process_info;
-  const shellPid = Number.isInteger(info?.shell_pid) ? Number(info.shell_pid) : null;
+  // After `pane run` the reported shell pid can be stale: the command runs in a
+  // new foreground job. Walking only the shell pid then misses the real Pi
+  // process, so every plausible root is used.
+  const roots = [info?.shell_pid, info?.foreground_process_group_id]
+    .filter((pid: unknown) => Number.isInteger(pid))
+    .map((pid: number) => Number(pid));
   const foreground = (Array.isArray(info?.foreground_processes) ? info.foreground_processes : [])
     .filter((row: any) => row && Number.isInteger(row.pid))
     .map((row: any) => ({
@@ -731,7 +736,8 @@ function paneProcessInfo(surface: string): { shellPid: number | null; foreground
       name: typeof row.name === "string" ? row.name : "",
       cmdline: typeof row.cmdline === "string" ? row.cmdline : undefined,
     }));
-  return { shellPid, foreground };
+  for (const proc of foreground) if (!roots.includes(proc.pid)) roots.push(proc.pid);
+  return { roots, foreground };
 }
 
 /**
@@ -739,7 +745,7 @@ function paneProcessInfo(surface: string): { shellPid: number | null; foreground
  * table; tests supply fixed process tables so no real pane is touched.
  */
 export interface PanePiProbeDeps {
-  paneProcessInfo(surface: string): { shellPid: number | null; foreground: PaneProcess[] };
+  paneProcessInfo(surface: string): { roots: number[]; foreground: PaneProcess[] };
   descendants(rootPid: number): PaneProcess[];
 }
 
@@ -770,7 +776,7 @@ export function probePanePiProcess(
     return { ok: false, reason: "session_mismatch", detail: "this run has no session file to match" };
   }
 
-  let info: { shellPid: number | null; foreground: PaneProcess[] };
+  let info: { roots: number[]; foreground: PaneProcess[] };
   try {
     info = deps.paneProcessInfo(surface);
   } catch (error: any) {
@@ -787,12 +793,16 @@ export function probePanePiProcess(
 
   let candidates: PaneProcess[];
   if (platform === "win32") {
-    if (info.shellPid === null) {
-      return { ok: false, reason: "probe_unavailable", detail: "Herdr did not report the pane's shell process" };
+    if (info.roots.length === 0) {
+      return { ok: false, reason: "probe_unavailable", detail: "Herdr did not report the pane's processes" };
     }
-    let descendants: PaneProcess[];
+    let descendants: PaneProcess[] = [];
     try {
-      descendants = deps.descendants(info.shellPid);
+      for (const root of info.roots) {
+        for (const proc of deps.descendants(root)) {
+          if (!descendants.some((seen) => seen.pid === proc.pid)) descendants.push(proc);
+        }
+      }
     } catch (error: any) {
       return {
         ok: false,
@@ -800,24 +810,26 @@ export function probePanePiProcess(
         detail: `could not query the process tree: ${error?.message ?? String(error)}`,
       };
     }
-    // The shell itself is not a candidate: a shell must never receive this text.
+    // No root is itself a candidate: a shell must never receive this text.
     // `conhost` is part of the pane's plumbing, not a child of interest.
     const interesting = descendants.filter(
-      (proc) => proc.pid !== info.shellPid && !/^(?:conhost|conpty|OpenConsole)(?:\.exe)?$/i.test(proc.name),
+      (proc) =>
+        !info.roots.includes(proc.pid) &&
+        !/^(?:conhost|conpty|OpenConsole)(?:\.exe)?$/i.test(proc.name),
     );
     candidates = interesting.filter((proc) => PI_PROCESS_NAME.test(proc.name));
     if (candidates.length === 0) {
       return {
         ok: false,
-        reason: interesting.length === 0 ? "shell_only" : "no_child",
-        detail: "no Pi process runs inside this pane's shell tree",
+        reason: "no_child",
+        detail: "no Pi process runs inside this pane's process tree",
       };
     }
   } else {
     // Unix panes report the foreground job directly, so no extra query is
     // needed; only an already-identified Pi counts.
     candidates = info.foreground.filter(
-      (proc) => proc.pid !== info.shellPid && PI_PROCESS_NAME.test(proc.name),
+      (proc) => !info.roots.includes(proc.pid) && PI_PROCESS_NAME.test(proc.name),
     );
     if (candidates.length === 0) {
       return {
