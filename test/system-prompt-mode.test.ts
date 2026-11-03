@@ -4,7 +4,8 @@
  * The field decides where an agent's identity text is delivered:
  * - `append` / `replace` → written to a file and passed as
  *   `--append-system-prompt` / `--system-prompt`.
- * - omitted or invalid → the body is prepended to the task prompt instead.
+ * - omitted or invalid → `systemPromptMode` stays undefined, so the identity
+ *   is prepended to the task prompt instead.
  *
  * These tests call the shipped code (`parseAgentDefinition` through
  * `loadAgentDefaults`, and `applySandboxToParts` for the CLI flags) rather than
@@ -27,6 +28,13 @@ function agentFile(frontmatter: string, body = "You are a specialized agent."): 
  *
  * `loadAgentDefaults` searches the project dir, then the global agent dir, then
  * the bundled agents, so the fixture goes into an isolated global agent dir.
+ */
+/**
+ * Load one agent file through the real loader.
+ *
+ * `loadAgentDefaults` searches the project dir, then the global agent dir, then
+ * the bundled agents, so the fixture goes into an isolated global agent dir.
+ * The previous `PI_CODING_AGENT_DIR` is restored afterwards.
  */
 function loadAgent(frontmatter: string, body?: string): any {
   const dir = mkdtempSync(join(tmpdir(), "pi-test-spm-"));
@@ -77,10 +85,17 @@ function withSandboxParts(
 
 describe("system-prompt frontmatter", () => {
   it("reads replace and append, and ignores anything else", () => {
-    assert.equal(loadAgent("system-prompt: replace")?.systemPromptMode, "replace");
-    assert.equal(loadAgent("system-prompt: append")?.systemPromptMode, "append");
-    assert.equal(loadAgent("model: anthropic/test-model")?.systemPromptMode, undefined);
-    assert.equal(loadAgent("system-prompt: foobar")?.systemPromptMode, undefined);
+    const replace = loadAgent("system-prompt: replace");
+    const append = loadAgent("system-prompt: append");
+    const unset = loadAgent("model: anthropic/test-model");
+    const invalid = loadAgent("system-prompt: foobar");
+    // Assert the file parsed at all: otherwise a rejected file would also read
+    // as "undefined mode" and pass for the wrong reason.
+    for (const loaded of [replace, append, unset, invalid]) assert.ok(loaded);
+    assert.equal(replace.systemPromptMode, "replace");
+    assert.equal(append.systemPromptMode, "append");
+    assert.equal(unset.systemPromptMode, undefined);
+    assert.equal(invalid.systemPromptMode, undefined);
   });
 
   it("keeps the agent body available for the task-prompt fallback", () => {
@@ -126,10 +141,22 @@ describe("system-prompt delivery", () => {
 
 describe("bundled agents", () => {
   it("declare append mode so their body is not duplicated into the task", () => {
-    for (const name of ["scout", "researcher", "worker"]) {
-      const loaded = api.loadAgentDefaults(name);
-      assert.ok(loaded, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(loaded.systemPromptMode, "append", `${name} should use system-prompt: append`);
+    // Read the repository's agents/*.md, not whatever shadows them in the
+    // user's global agent dir: loadAgentDefaults checks that dir first.
+    const dir = mkdtempSync(join(tmpdir(), "pi-test-spm-bundled-"));
+    mkdirSync(join(dir, "agents"), { recursive: true });
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = dir;
+    try {
+      for (const name of ["scout", "researcher", "worker"]) {
+        const loaded = api.loadAgentDefaults(name);
+        assert.ok(loaded, `expected bundled agent ${name} to be discoverable`);
+        assert.equal(loaded.systemPromptMode, "append", `${name} should use system-prompt: append`);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

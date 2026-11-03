@@ -1742,11 +1742,15 @@ describe("subagent-done.ts", () => {
         name: process.env.PI_SUBAGENT_NAME,
         agent: process.env.PI_SUBAGENT_AGENT,
         autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+        denyTools: process.env.PI_DENY_TOOLS,
       };
       process.env.PI_SUBAGENT_SESSION = join(tmpdir(), "widget-test-session.jsonl");
       process.env.PI_SUBAGENT_NAME = "widget-test";
       process.env.PI_SUBAGENT_AGENT = "scout";
       delete process.env.PI_SUBAGENT_AUTO_EXIT;
+      // The widget renders the denied list from this variable; clear it so the
+      // expanded output is deterministic.
+      delete process.env.PI_DENY_TOOLS;
       subagentDoneExtension(api);
 
       const ctx = {
@@ -1763,6 +1767,7 @@ describe("subagent-done.ts", () => {
         restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
         restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+        restoreEnvVar("PI_DENY_TOOLS", saved.denyTools);
       };
 
       const render = (expanded = false) => {
@@ -1821,6 +1826,22 @@ describe("subagent-done.ts", () => {
         const output = render(true);
         assert.match(output, /0 available/);
         assert.doesNotMatch(output, /bash/);
+      } finally {
+        restore();
+      }
+    });
+
+    it("renders the collapsed form as a count without tool names", () => {
+      const { render, restore } = setupWidgetExtension({
+        active: ["ask_question", "read"],
+        all: [{ name: "ask_question" }, { name: "read" }, { name: "bash" }],
+      });
+      try {
+        const output = render(false);
+        assert.match(output, /2 tools/);
+        assert.match(output, /to expand/);
+        assert.doesNotMatch(output, /bash/);
+        assert.doesNotMatch(output, /ask_question/, "the collapsed form lists no names");
       } finally {
         restore();
       }

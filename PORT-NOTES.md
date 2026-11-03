@@ -243,8 +243,10 @@ no per-server isolation for MCP.
    `subagent_wait` blocked ~40 s before returning `completed`. The server also
    reported the child pane's agent as `pi-bolt`, and the child session stayed
    in the parent's `--session-dir`. The user's live server, socket, and layout
-   were unchanged. Herdr TUI resume and desktop resume remain unverified, as
-   does the TUI client's own rendering and focus behaviour.
+   were unchanged. The last probe ran on the working tree that became commit
+   `0812c2d`; an earlier probe on `c4f5bf9` asserted the pane geometry.
+   Herdr TUI resume and desktop resume remain unverified, as does the TUI
+   client's own rendering and focus behaviour.
 3. `/subagent-doctor` was run in a live Pi-Bolt session and printed real
    extension paths resolved through `getAllTools().sourceInfo`: pi-web-access
    (`web_search`, `fetch_content`, `get_search_content`, `source_check` →
@@ -252,30 +254,30 @@ no per-server isolation for MCP.
    `subagent-done.ts`, and `antigravity-acp` →
    `…/pi-antigravity-acp-provider/extensions/index.ts`. The earlier
    `getAllTools` mock coverage is superseded by this live run.
-5. The provider extension path was tested with a temporary fixture matching the
+4. The provider extension path was tested with a temporary fixture matching the
    real npm layout, not with a live `antigravity-acp/*` model call.
-6. The retry loop is covered with injected dependencies, not a real provider
+5. The retry loop is covered with injected dependencies, not a real provider
    failure. `retryNudge`, `buildResumeCommand`, defaults, summary baselines,
    retry/summary/delivery exceptions, and the same-id join behavior are tested,
    but no child was actually resumed after an upstream error.
-7. A native blocked-UI signal is not wired into joins. The join class supports
+6. A native blocked-UI signal is not wired into joins. The join class supports
    `blocked`, but this upstream has no poll event for Herdr `agent_blocked`
    (it only surfaces as a steer error). `ask_question` early return is wired
    through the `.ask` file and is tested. Any child question releases a wait,
    including one for unrelated names, by design: a queued steer cannot be
    answered while a tool call is blocked.
-8. `npm run test:integration` was not run: it starts live pi sessions and model
+7. `npm run test:integration` was not run: it starts live pi sessions and model
    requests in Herdr surfaces.
-9. Native Windows cwd, a Git Bash `/c/...` cwd, and both absolute and relative
+8. Native Windows cwd, a Git Bash `/c/...` cwd, and both absolute and relative
    custom session-directory placement were exercised in headless Core; live
    resume/fork across cwd remains unverified.
-10. Only `antigravity-acp` and the upstream Anthropic auth extension have
+9. Only `antigravity-acp` and the upstream Anthropic auth extension have
     provider mappings. Other extension-provided providers need an entry or
     `registerProviderExtension`.
-11. The fork/lineage summary baseline is tested at the `summarizeAttempt`
+10. The fork/lineage summary baseline is tested at the `summarizeAttempt`
     level, not by spawning a real seeded fork session. Verify with a live fork
     run before relying on the last-message summary.
-12. Omitted-model resolution follows pi's trust order but cannot run project
+11. Omitted-model resolution follows pi's trust order but cannot run project
     extension `project_trust` handlers: a project `.pi/extensions` directory
     fails closed. With no project settings file no trust gate is applied. When
     one exists, explicit trust-store decisions win; `always`/`never` are

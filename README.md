@@ -241,7 +241,7 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 ## Status widget & configuration
 
-The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — it lists the tools the child can actually call (its active set after `--tools` filtering), not every registered tool — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
+The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — it lists the tools the child can call, taken from the active set declared at session start after `--tools` filtering, not every registered tool — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
 Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
 

@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSy
 import { tmpdir } from "node:os";
 import { dirname, basename, isAbsolute, join, resolve, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
-import extension, { __test__ as api } from "../pi-extension/subagents/index.ts";
+import extension, { __test__ as api, normalizePiPath as publicNormalizePiPath } from "../pi-extension/subagents/index.ts";
 import { shellEscape } from "../pi-extension/subagents/herdr.ts";
 import {
   loadoutSidecarPath,
@@ -768,7 +768,9 @@ it("keeps paths.ts free of extension imports and re-exported by index.ts", async
   assert.deepEqual(imports.sort(), ["node:fs", "node:os", "node:path", "node:url"]);
 
   const paths = await import("../pi-extension/subagents/paths.ts");
-  // Same behaviour through both entry points: the index re-export is not a copy.
+  // Same function through both entry points: the index re-export is not a copy,
+  // and the named export is still reachable for existing importers.
+  assert.equal(publicNormalizePiPath, paths.normalizePiPath);
   assert.equal(paths.normalizePiPath, api.normalizePiPath);
   assert.equal(paths.normalizeWindowsShellPath, api.normalizeWindowsShellPath);
   assert.equal(paths.resolvePiPath, api.resolvePiPath);
