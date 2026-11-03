@@ -62,11 +62,41 @@ function errorMessage(error: any): string {
   return error?.message ?? String(error);
 }
 
+/**
+ * A mux call failed because the pane/terminal itself is gone: the user closed
+ * it, or the terminal exited. Kept distinct from a transport failure (socket
+ * error, CLI crash, timeout), which must never be mistaken for a closed
+ * surface.
+ */
+export class SurfaceGoneError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SurfaceGoneError";
+  }
+}
+
+/**
+ * True when hc reported `kind: "not_found"` for the terminal. Exported so the
+ * predicate can be tested against the real hc error payload without hc
+ * installed.
+ */
+export function isHcNotFound(error: any): boolean {
+  for (const text of [error?.stderr, error?.stdout]) {
+    if (typeof text !== "string" || !text.trim()) continue;
+    try {
+      if (JSON.parse(text.trim())?.error?.kind === "not_found") return true;
+    } catch {}
+  }
+  return false;
+}
+
 function hc(args: string[]): string {
   try {
     return execFileSync(hcBin(), args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   } catch (error: any) {
-    throw new Error(`hc ${args[0]} failed: ${errorMessage(error)}`);
+    const message = `hc ${args[0]} failed: ${errorMessage(error)}`;
+    if (isHcNotFound(error)) throw new SurfaceGoneError(message);
+    throw new Error(message);
   }
 }
 
@@ -289,7 +319,9 @@ export async function readDesktopScreenAsync(terminal: string, lines: number): P
     );
     return lastLines(stdout, lines);
   } catch (error: any) {
-    throw new Error(`hc read failed: ${errorMessage(error)}`);
+    const message = `hc read failed: ${errorMessage(error)}`;
+    if (isHcNotFound(error)) throw new SurfaceGoneError(message);
+    throw new Error(message);
   }
 }
 
@@ -300,7 +332,14 @@ export async function readDesktopScreenAsync(terminal: string, lines: number): P
 export async function desktopExitState(
   terminal: string,
 ): Promise<{ finished: false } | { finished: true; exitCode: number }> {
-  const { stdout } = await execFileAsync(hcBin(), ["get", terminal, "--json"], { encoding: "utf8" });
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync(hcBin(), ["get", terminal, "--json"], { encoding: "utf8" }));
+  } catch (error: any) {
+    const message = `hc get failed: ${errorMessage(error)}`;
+    if (isHcNotFound(error)) throw new SurfaceGoneError(message);
+    throw new Error(message);
+  }
   return exitStateOf(JSON.parse(stdout));
 }
 

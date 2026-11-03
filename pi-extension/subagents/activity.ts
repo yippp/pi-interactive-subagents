@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
 export type SubagentActivityScope = "agent" | "turn" | "provider" | "streaming" | "tool";
@@ -199,14 +199,18 @@ export function readSubagentActivityFile(
   return validateActivity(parsed, expectedRunningChildId);
 }
 
-export function writeSubagentActivityFile(activityFile: string, activity: SubagentActivityState): void {
-  const dir = dirname(activityFile);
+/**
+ * Write a file so a concurrent reader never sees a partial payload: write a
+ * sibling temp file, then rename it over the target. The temp file is removed
+ * when the write or rename fails, and the original failure is rethrown.
+ */
+export function writeFileAtomic(file: string, data: string): void {
+  const dir = dirname(file);
   mkdirSync(dir, { recursive: true });
-  const tempFile = join(dir, `${activity.runningChildId}.json.${process.pid}.${activity.sequence}.tmp`);
-
+  const tempFile = join(dir, `.${basename(file)}.${process.pid}.${Date.now()}.tmp`);
   try {
-    writeFileSync(tempFile, `${JSON.stringify(activity)}\n`, "utf8");
-    renameSync(tempFile, activityFile);
+    writeFileSync(tempFile, data, "utf8");
+    renameSync(tempFile, file);
   } catch (error) {
     try {
       unlinkSync(tempFile);
@@ -216,6 +220,10 @@ export function writeSubagentActivityFile(activityFile: string, activity: Subage
     }
     throw error;
   }
+}
+
+export function writeSubagentActivityFile(activityFile: string, activity: SubagentActivityState): void {
+  writeFileAtomic(activityFile, `${JSON.stringify(activity)}\n`);
 }
 
 function createNoopRecorder(): SubagentActivityRecorder {

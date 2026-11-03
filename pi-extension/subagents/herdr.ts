@@ -28,6 +28,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node
 import { tmpdir } from "node:os";
 import { isAbsolute, basename, dirname, join } from "node:path";
 import {
+  SurfaceGoneError,
   closeDesktopSurface,
   createDesktopSurface,
   desktopExitState,
@@ -180,6 +181,7 @@ function herdrErrorMessage(error: any): string {
 // ── Shell helpers ──
 // Shared with herdr-desktop.ts, which must not import this module (cycle).
 export { resolveBash, shellEscape } from "./shell.ts";
+export { SurfaceGoneError } from "./herdr-desktop.ts";
 import { resolveBash, shellEscape } from "./shell.ts";
 
 /**
@@ -644,7 +646,7 @@ export function readScreen(surface: string, lines = 50): string {
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (error: any) {
-    throw new Error(`herdr pane read failed: ${herdrErrorMessage(error)}`);
+    throw surfaceError("herdr pane read failed", error);
   }
 }
 
@@ -660,8 +662,45 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     });
     return stdout;
   } catch (error: any) {
-    throw new Error(`herdr pane read failed: ${herdrErrorMessage(error)}`);
+    throw surfaceError("herdr pane read failed", error);
   }
+}
+
+/**
+ * True when herdr reported the pane itself is gone (`pane_not_found`) rather
+ * than failing to reach the server.
+ */
+export function isHerdrSurfaceGone(error: any): boolean {
+  for (const text of [error?.stderr, error?.stdout]) {
+    if (typeof text !== "string" || !text.trim()) continue;
+    try {
+      const parsed = JSON.parse(text.trim());
+      if (parsed?.error?.code === "pane_not_found") return true;
+    } catch {}
+  }
+  return false;
+}
+
+/**
+ * True when a mux error message means the target pane/terminal does not exist.
+ * Used to make closing an already-gone pane a no-op (idempotent cleanup)
+ * without swallowing unrelated mux failures.
+ */
+export function isSurfaceGoneMessage(message: string): boolean {
+  return /pane_not_found|terminal_not_found|tab_not_found|workspace_not_found|\bnot_found\b/i.test(
+    message,
+  );
+}
+
+/**
+ * Classify a mux failure: a closed pane/terminal becomes SurfaceGoneError so
+ * callers can stop waiting for a surface that no longer exists, while every
+ * other failure (socket, CLI crash, timeout) stays a plain Error and is
+ * retried by the caller.
+ */
+function surfaceError(prefix: string, error: any): Error {
+  const message = `${prefix}: ${herdrErrorMessage(error)}`;
+  return isHerdrSurfaceGone(error) ? new SurfaceGoneError(message) : new Error(message);
 }
 
 /**
@@ -670,7 +709,15 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 export function closeSurface(surface: string): void {
   requireMux();
   if (isHerdrDesktopAvailable()) return closeDesktopSurface(surface);
-  herdrJson(["pane", "close", surface]);
+  try {
+    herdrJson(["pane", "close", surface]);
+  } catch (error: any) {
+    // Closing a pane that already disappeared is a no-op, not a failure: the
+    // user may have closed it after the child finished. Any other error still
+    // propagates so a broken mux is not silently ignored.
+    if (isSurfaceGoneMessage(error?.message ?? String(error))) return;
+    throw error;
+  }
   rebalanceSurfaces();
 }
 
@@ -678,11 +725,17 @@ export function closeSurface(surface: string): void {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "sentinel" | "error";
+  reason: "done" | "sentinel" | "error" | "surface_lost";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
+  /**
+   * Why the pane/terminal was lost, when reason is "surface_lost". This is a
+   * local/terminal condition (the user closed the pane, or the mux stopped
+   * answering), never a provider failure, so it must not drive a provider retry.
+   */
+  surfaceLostReason?: string;
 }
 
 /**
@@ -705,8 +758,63 @@ function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
+export const __pollForExitTest__ = {
+  interpretExitSidecar,
+  parseSentinelExitCode,
+  isSurfaceGoneError,
+};
 export const __layoutTest__ = { planEvenSplits, chooseSplitDirection, chooseSurfaceKind };
+
+/** Exit code from the terminal sentinel a launch script echoes, or null. */
+export function parseSentinelExitCode(screen: string): number | null {
+  const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+/** The shell suffix every launch script appends with its exit code. */
+export const EXIT_SENTINEL_ECHO = "echo '__SUBAGENT_DONE_'$?'__'";
+
+/** Append the exit-code sentinel echo to a command (shell semantics unchanged). */
+export function withExitSentinel(command: string): string {
+  return `${command}; ${EXIT_SENTINEL_ECHO}`;
+}
+
+/** Remove the sentinel from screen text so it does not leak into summaries. */
+export function stripExitSentinel(text: string): string {
+  return text.replace(/__SUBAGENT_DONE_\d+__/, "");
+}
+
+/** True when a read failed because the pane/terminal no longer exists. */
+export function isSurfaceGoneError(error: unknown): boolean {
+  return error instanceof SurfaceGoneError || (error as any)?.name === "SurfaceGoneError";
+}
+
+/** Read and consume the `.exit` sidecar, if one appeared. */
+function takeExitSidecar(sessionFile: string | undefined): PollResult | null {
+  if (!sessionFile) return null;
+  const exitFile = `${sessionFile}.exit`;
+  try {
+    if (!existsSync(exitFile)) return null;
+    const data = JSON.parse(readFileSync(exitFile, "utf-8"));
+    rmSync(exitFile, { force: true });
+    return interpretExitSidecar(data);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Consecutive reads that must report "pane/terminal not found" before the
+ * surface counts as gone. One flaky CLI call must not end a live run.
+ */
+const DEFAULT_GONE_CONFIRMATIONS = 3;
+
+/**
+ * How long reads may keep failing for another reason (mux socket down, CLI
+ * crash) before the wait gives up. Transport trouble is retried, not treated as
+ * a closed pane, but it cannot hang the watcher forever either.
+ */
+const DEFAULT_TRANSPORT_FAILURE_LIMIT_MS = 30_000;
 
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
@@ -721,26 +829,34 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    /** Reads that must confirm "pane/terminal not found" before the surface is gone. */
+    goneConfirmations?: number;
+    /** Transport failures tolerated before the wait gives up (never a closed pane). */
+    transportFailureLimitMs?: number;
+    /** Injection seam for tests: defaults probe the real multiplexer. */
+    deps?: Partial<PollDeps>;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  const deps: PollDeps = { ...defaultPollDeps(), ...options.deps };
+  const goneConfirmations = options.goneConfirmations ?? DEFAULT_GONE_CONFIRMATIONS;
+  const transportFailureLimitMs =
+    options.transportFailureLimitMs ?? DEFAULT_TRANSPORT_FAILURE_LIMIT_MS;
+
+  // Consecutive "not found" reads, and when the current streak of other read
+  // failures began. A closed pane is confirmed before the wait ends; plain
+  // transport trouble is retried but bounded so a dead mux cannot hang the wait.
+  let goneReads = 0;
+  let transportFailureSince: number | null = null;
 
   for (;;) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    // Fast path: check for .exit sidecar file (written by the error path)
-    if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
-    }
+    // Fast path: a finished child may have written its result sidecar.
+    const sidecar = takeExitSidecar(options.sessionFile);
+    if (sidecar) return sidecar;
 
     // Check Claude sentinel file (written by plugin Stop hook)
     if (options.sentinelFile) {
@@ -755,31 +871,53 @@ export async function pollForExit(
     // Desktop terminals end with their launch script, so herdr-core's record
     // says when; the screen only supplies pi's exit code.
     try {
-      if (isHerdrDesktopAvailable()) {
-        const state = await desktopExitState(surface);
+      if (deps.isDesktop()) {
+        const state = await deps.desktopExit(surface);
         if (state.finished) {
-          const screen = await readScreenAsync(surface, 5).catch(() => "");
-          const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-          return { reason: "sentinel", exitCode: match ? parseInt(match[1], 10) : state.exitCode };
+          const screen = await deps.readScreen(surface, 5).catch(() => "");
+          return {
+            reason: "sentinel",
+            exitCode: parseSentinelExitCode(screen) ?? state.exitCode,
+          };
         }
       } else {
-        const screen = await readScreenAsync(surface, 5);
-        const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-        if (match) {
-          return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-        }
+        const exitCode = parseSentinelExitCode(await deps.readScreen(surface, 5));
+        if (exitCode != null) return { reason: "sentinel", exitCode };
       }
-    } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
+      goneReads = 0;
+      transportFailureSince = null;
+    } catch (error) {
+      // A finished child may have written the .exit sidecar in the same tick.
+      const lateSidecar = takeExitSidecar(options.sessionFile);
+      if (lateSidecar) return lateSidecar;
+
+      const now = Date.now();
+      if (isSurfaceGoneError(error)) {
+        // `pane_not_found`/`not_found` is a definitive answer: the pane or
+        // terminal ceased to exist (the user closed it, or the app removed
+        // it). Confirm over a few reads so one flaky CLI call cannot end a
+        // live run, then return without an errorMessage so the provider-retry
+        // path does not reopen a pane the user just closed.
+        goneReads += 1;
+        if (goneReads >= goneConfirmations) {
+          return {
+            reason: "surface_lost",
+            exitCode: 1,
+            surfaceLostReason: describeSurfaceLoss(error),
+          };
+        }
+      } else {
+        goneReads = 0;
+        transportFailureSince ??= now;
+        if (now - transportFailureSince >= transportFailureLimitMs) {
+          return {
+            reason: "surface_lost",
+            exitCode: 1,
+            surfaceLostReason: `could not read the subagent pane for ${Math.round(
+              (now - transportFailureSince) / 1000,
+            )}s (${error instanceof Error ? error.message : String(error)})`,
+          };
+        }
       }
     }
 
@@ -799,4 +937,29 @@ export async function pollForExit(
       signal.addEventListener("abort", onAbort, { once: true });
     });
   }
+}
+
+interface PollDeps {
+  readScreen(surface: string, lines: number): Promise<string>;
+  desktopExit(
+    surface: string,
+  ): Promise<{ finished: false } | { finished: true; exitCode: number }>;
+  isDesktop(): boolean;
+}
+
+function defaultPollDeps(): PollDeps {
+  return {
+    readScreen: readScreenAsync,
+    desktopExit: desktopExitState,
+    isDesktop: isHerdrDesktopAvailable,
+  };
+}
+
+/** Human-readable cause for a lost surface, without leaking provider wording. */
+function describeSurfaceLoss(error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error);
+  const hint = /no terminal|not_found/i.test(detail)
+    ? "its terminal was closed or removed"
+    : "its pane no longer exists";
+  return `subagent ${hint}; no exit status was reported (${detail})`;
 }

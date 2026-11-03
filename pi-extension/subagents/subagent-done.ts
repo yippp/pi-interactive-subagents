@@ -16,7 +16,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
-import { createSubagentActivityRecorder } from "./activity.ts";
+import { createSubagentActivityRecorder, writeFileAtomic } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -379,8 +379,14 @@ export default function (pi: ExtensionAPI) {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
+        // Unique per ask so the parent can tell a repeated question apart from
+        // the same file still sitting there after a delivered one.
+        askId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+      // Atomic write: the parent's watcher polls this file once per second and
+      // must never read a half-written payload (it keeps the file until it
+      // parses, so a torn write would stall the question instead of losing it).
+      writeFileAtomic(`${sessionFile}.ask`, JSON.stringify(askData));
 
       return {
         content: [

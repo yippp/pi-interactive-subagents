@@ -18,6 +18,7 @@ const files = [
   "test/retry.test.ts",
   "test/system-prompt-mode.test.ts",
   "test/windows-launch.test.ts",
+  "test/lifecycle-regressions.test.ts",
 ];
 
 const env = { ...process.env };

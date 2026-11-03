@@ -31,6 +31,8 @@ import {
   createSurface,
   sendMessage,
   sendLongCommand,
+  withExitSentinel,
+  stripExitSentinel,
   pollForExit,
   closeSurface,
   shellEscape,
@@ -396,20 +398,40 @@ function getToolExtensionPath(tool: string): string | undefined {
  * Returns undefined when the package is absent or the child is not on an
  * Anthropic OAuth model, so nothing changes for API-key or other providers.
  */
-function getProviderAuthExtensionPath(model: string | null | undefined): string | undefined {
+function getProviderAuthExtensionPath(
+  model: string | null | undefined,
+  agentDir: string = getAgentConfigDir(),
+): string | undefined {
   if (!model?.startsWith("anthropic/")) return undefined;
 
+  const authFile = join(agentDir, "auth.json");
   let credentials: string;
   try {
-    credentials = readFileSync(join(getAgentConfigDir(), "auth.json"), "utf8");
+    credentials = readFileSync(authFile, "utf8");
   } catch {
     return undefined; // no stored credentials: API key or env-var auth
   }
-  const access = JSON.parse(credentials)?.anthropic?.access;
+
+  // An existing-but-corrupt auth.json must fail loudly. Falling back to
+  // `undefined` here would drop the OAuth transport extension and let the
+  // child die on its first request with `400 You're out of extra usage`.
+  // The message names the file and the parse position only — never the file
+  // contents, which hold the subscription token.
+  let access: unknown;
+  try {
+    access = JSON.parse(credentials)?.anthropic?.access;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Cannot read the stored Anthropic credentials at ${authFile}: the file is not valid JSON ` +
+        `(${detail}). Fix or remove it (for example by signing in again), then retry. ` +
+        `Refusing to launch a Claude subagent without the auth transport extension.`,
+    );
+  }
   if (typeof access !== "string" || !access.startsWith("sk-ant-oat")) return undefined;
 
   const path = join(
-    getAgentConfigDir(),
+    agentDir,
     "npm",
     "node_modules",
     "@gotgenes",
@@ -1026,13 +1048,24 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "surfaceLost"
   >,
   name: string,
 ): string {
   // Name is the persistent handle: the same name steers a running subagent or
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+
+  if (result.surfaceLost) {
+    // The user closed the pane (or the terminal went away). Report it plainly
+    // and say it was not retried: this is not a provider failure.
+    return (
+      `Sub-agent "${name}" stopped after ${formatElapsed(result.elapsed)}: ${result.surfaceLost}.\n\n` +
+      `${result.summary}\n\n` +
+      `This is not a provider failure, so it was not retried automatically. ` +
+      `Its session file is kept — resume the same session with subagent_message if the work should continue.${sessionRef}`
+    );
+  }
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -1067,8 +1100,16 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
-  /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
+  /**
+   * Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.).
+   */
   errorMessage?: string;
+  /**
+   * Set when the pane/terminal disappeared before the child reported an exit.
+   * Distinct from errorMessage: this is not a provider failure and must not be
+   * retried.
+   */
+  surfaceLost?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
 }
@@ -1099,6 +1140,12 @@ interface RunningSubagent {
   entryCountBefore?: number;
   /** True while the run is being resumed after a provider/agent error. */
   retrying?: boolean;
+  /** First tick that saw an unparseable `.ask` file; drives the give-up window. */
+  pendingAskSince?: number;
+  /** Set once the parent reported that an `.ask` payload could not be read. */
+  invalidAskReported?: boolean;
+  /** Payload key already delivered, so a failed delete cannot re-notify. */
+  deliveredAskKey?: string;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1404,13 +1451,8 @@ function applySandboxToParts(
   if (loadout.identity) {
     const flag = loadout.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
     const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const spSafeName = opts.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-    const spPath = join(opts.artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
+    const spSafeName = subagentSlug(opts.name, "subagent");
+    const spPath = join(opts.artifactDir, `context/${spSafeName}-sysprompt-${spTimestamp}.md`);
     mkdirSync(dirname(spPath), { recursive: true });
     writeFileSync(spPath, loadout.identity, "utf8");
     parts.push(flag, shellEscape(spPath));
@@ -1742,6 +1784,7 @@ export const __test__ = {
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
+  getProviderAuthExtensionPath,
   providerExtensionPath,
   providerExtensionMap,
   resolveRunningByName,
@@ -1775,6 +1818,11 @@ export const __test__ = {
   lastModelInSession,
   watchSubagentWithRetry,
   summarizeAttempt,
+  launchSubagent,
+  retrySubagentRun,
+  setLaunchSurfaceDeps,
+  openLaunchSurface,
+  sendLaunchCommand,
 };
 
 function startWidgetRefresh() {
@@ -1784,6 +1832,80 @@ function startWidgetRefresh() {
     updateWidget();
   }, 1000);
   (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
+}
+
+/**
+ * Surface operations a launch needs. Production uses the multiplexer; tests
+ * inject these to exercise launch-failure cleanup without opening panes.
+ */
+interface LaunchSurfaceDeps {
+  create(name: string): string;
+  send(
+    surface: string,
+    command: string,
+    options: { scriptPath?: string; scriptPreamble?: string },
+  ): void;
+  close(surface: string): void;
+  /** Pause after creating a pane so its shell is ready. */
+  waitForShell(): Promise<void>;
+}
+
+const defaultLaunchSurfaceDeps: LaunchSurfaceDeps = {
+  create: createSurface,
+  send: sendLongCommand,
+  close: closeSurface,
+  waitForShell: () =>
+    new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs())),
+};
+
+/** Injection seam for launch/resume/retry tests. */
+let launchSurfaceDeps: LaunchSurfaceDeps = defaultLaunchSurfaceDeps;
+
+function setLaunchSurfaceDeps(deps?: Partial<LaunchSurfaceDeps>): void {
+  launchSurfaceDeps = { ...defaultLaunchSurfaceDeps, ...deps };
+}
+
+/**
+ * Open the surface a new subagent runs in: either the caller's pre-created
+ * one (parallel mode) or a fresh pane, then pause so its shell is ready before
+ * a command is typed into it. `owned` is false for a caller-provided surface:
+ * that surface belongs to the caller, so a failed launch leaves it alone.
+ */
+async function openLaunchSurface(
+  name: string,
+  preCreated: string | undefined,
+): Promise<{ surface: string; owned: boolean }> {
+  if (preCreated) return { surface: preCreated, owned: false };
+  const surface = launchSurfaceDeps.create(name);
+  await launchSurfaceDeps.waitForShell();
+  return { surface, owned: true };
+}
+
+/**
+ * Send a launch/resume command to a surface. When the send fails, close only a
+ * surface this launch owns (never a caller-provided one) and rethrow the
+ * original error, so the caller sees why the launch failed. Shared by the
+ * initial spawn, `subagent_message` resume, and provider-error retry so all
+ * three clean up the same way.
+ */
+function sendLaunchCommand(
+  surface: string,
+  command: string,
+  options: { scriptPath?: string; scriptPreamble?: string },
+  ownedSurface: boolean,
+): void {
+  try {
+    launchSurfaceDeps.send(surface, command, options);
+  } catch (error) {
+    if (ownedSurface) {
+      try {
+        launchSurfaceDeps.close(surface);
+      } catch {
+        // Cleanup is best effort; the launch error must reach the caller.
+      }
+    }
+    throw error;
+  }
 }
 
 /**
@@ -1876,14 +1998,6 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
-
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
       mode: launchBehavior.seededSessionMode,
@@ -1943,24 +2057,29 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = withExitSentinel(`${cdPrefix}${cmdParts.join(" ")}`);
 
-    const launchScriptName = `${(params.name || "subagent")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+    const launchScriptName = `${subagentSlug(params.name, "subagent")}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
+    // Every fallible step above (seeding, sandbox snapshot, artifact write) is
+    // done before this point, so the pane opens only once the launch can no
+    // longer fail for a reason the user must fix.
+    const { surface, owned: ownsSurface } = await openLaunchSurface(params.name, options?.surface);
+
+    sendLaunchCommand(
+      surface,
+      command,
+      {
+        scriptPath: launchScriptFile,
+        scriptPreamble: [
+          `# Claude Code subagent launch script for ${params.name}`,
+          `# Generated: ${new Date().toISOString()}`,
+          `# Surface: ${surface}`,
+        ].join("\n"),
+      },
+      ownsSurface,
+    );
 
     const running: RunningSubagent = {
       id,
@@ -2033,6 +2152,38 @@ async function launchSubagent(
   // the shared helper (same code path resume uses — they can't drift).
   applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
 
+  // Pass task and skill prompts to the sub-agent.
+  // Only full-context fork mode gets a direct task argument because it already
+  // inherits the parent conversation. Blank-session modes use artifact-backed
+  // handoff so the wrapper instructions arrive as the initial user message.
+  let taskArg: string;
+  if (launchBehavior.taskDelivery === "direct") {
+    taskArg = fullTask;
+  } else {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const artifactName = `context/${subagentSlug(params.name, "subagent")}-${timestamp}.md`;
+    const artifactPath = join(artifactDir, artifactName);
+    mkdirSync(dirname(artifactPath), { recursive: true });
+    writeFileSync(artifactPath, fullTask, "utf8");
+    taskArg = `@${artifactPath}`;
+  }
+
+  for (const promptArg of buildPiPromptArgs({
+    effectiveSkills,
+    taskDelivery: launchBehavior.taskDelivery,
+    taskArg,
+  })) {
+    parts.push(shellEscape(promptArg));
+  }
+
+  // Resolve cwd — param overrides agent default, supports absolute and relative paths.
+  // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
+  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+
+  // Every fallible setup step (snapshot, sandbox, task artifact) is done. Open
+  // the pane only now, so a setup failure cannot leave an empty pane behind.
+  const { surface, owned: ownsSurface } = await openLaunchSurface(params.name, options?.surface);
+
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = [];
 
@@ -2056,61 +2207,27 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
-  // Pass task and skill prompts to the sub-agent.
-  // Only full-context fork mode gets a direct task argument because it already
-  // inherits the parent conversation. Blank-session modes use artifact-backed
-  // handoff so the wrapper instructions arrive as the initial user message.
-  let taskArg: string;
-  if (launchBehavior.taskDelivery === "direct") {
-    taskArg = fullTask;
-  } else {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
-      .replace(/\s+/g, "-") // spaces to hyphens
-      .replace(/-+/g, "-") // collapse multiple hyphens
-      .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
-    const artifactPath = join(artifactDir, artifactName);
-    mkdirSync(dirname(artifactPath), { recursive: true });
-    writeFileSync(artifactPath, fullTask, "utf8");
-    taskArg = `@${artifactPath}`;
-  }
-
-  for (const promptArg of buildPiPromptArgs({
-    effectiveSkills,
-    taskDelivery: launchBehavior.taskDelivery,
-    taskArg,
-  })) {
-    parts.push(shellEscape(promptArg));
-  }
-
-  // Resolve cwd — param overrides agent default, supports absolute and relative paths.
-  // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
-  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  const launchScriptName = `${(params.name || "subagent")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+  const command = withExitSentinel(piCommand);
+  const launchScriptName = `${subagentSlug(params.name, "subagent")}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   // Seeded fork/lineage sessions already contain parent entries. Baseline
   // after seeding so the result summary only covers this child's own output.
   const entryCountBefore = countSessionEntryLines(subagentSessionFile);
-  sendLongCommand(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-  });
+  sendLaunchCommand(
+    surface,
+    command,
+    {
+      scriptPath: launchScriptFile,
+      scriptPreamble: [
+        `# Subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Session: ${subagentSessionFile}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+    },
+    ownsSurface,
+  );
 
   const running: RunningSubagent = {
     id,
@@ -2163,30 +2280,108 @@ function copyClaudeSession(sentinelFile: string): string | null {
 }
 
 /**
+ * How long a `.ask` file may stay unparseable before the parent gives up on it.
+ * The subagent writes it atomically, so a torn payload can only come from an
+ * interrupted write or external corruption; keeping it a few seconds lets a
+ * legitimate retry finish without losing the question.
+ */
+const ASK_INVALID_GRACE_MS = 10_000;
+
+function removeAskFile(askFile: string): void {
+  try {
+    unlinkSync(askFile);
+  } catch {
+    // Already gone; nothing else to do.
+  }
+}
+
+/**
  * Detect an `ask_question` signal from a still-running subagent and notify the
  * orchestrator without ending the subagent. Each subagent has its own
  * `${sessionFile}.ask` file and its own watcher, so parallel questions from
  * multiple subagents are delivered independently. The file is deleted after
  * delivery so it fires once per question (a subagent may ask again later).
+ *
+ * A file that does not parse yet is left in place: it may be a write in
+ * progress, and deleting it would silently drop the question. Only after
+ * `invalidGraceMs` does the parent drop it, and it reports that once — a
+ * permanently corrupt file must not loop or notify on every tick.
  */
-function deliverPendingQuestion(running: RunningSubagent): void {
+function deliverPendingQuestion(
+  running: RunningSubagent,
+  options?: { now?: () => number; invalidGraceMs?: number },
+): void {
   const askFile = `${running.sessionFile}.ask`;
+  if (!existsSync(askFile)) {
+    delete running.pendingAskSince;
+    return;
+  }
+
+  const now = options?.now?.() ?? Date.now();
+  const invalidGraceMs = options?.invalidGraceMs ?? ASK_INVALID_GRACE_MS;
+
+  let raw: string;
   let payload: any = null;
+  let unparseable = false;
   try {
-    if (!existsSync(askFile)) return;
-    payload = JSON.parse(readFileSync(askFile, "utf-8"));
+    raw = readFileSync(askFile, "utf-8");
   } catch {
-    // Malformed/partway-written file — drop it and move on.
+    return; // Transient read failure (another writer mid-rename); try next tick.
   }
   try {
-    unlinkSync(askFile);
-  } catch {}
-  if (!payload?.question) return;
+    payload = JSON.parse(raw);
+  } catch {
+    unparseable = true;
+  }
+
+  // Complete JSON that carries no question cannot change any more: drop it
+  // right away and stay quiet, there is nothing to answer.
+  if (!unparseable && (typeof payload?.question !== "string" || !payload.question.trim())) {
+    removeAskFile(askFile);
+    delete running.pendingAskSince;
+    return;
+  }
+
+  if (unparseable) {
+    running.pendingAskSince ??= now;
+    if (now - running.pendingAskSince < invalidGraceMs) return;
+    removeAskFile(askFile);
+    delete running.pendingAskSince;
+    if (running.invalidAskReported) return;
+    running.invalidAskReported = true;
+    const elapsed = Math.floor((now - running.startTime) / 1000);
+    latestPi?.sendMessage(
+      {
+        customType: "subagent_question",
+        content:
+          `Sub-agent "${running.name}" asked a question (${formatElapsed(elapsed)}) but its ` +
+          `question file could not be read, so the text was dropped. It is still waiting: ` +
+          `reply with subagent_message({ name: "${running.name}", message: "…" }) to release it.`,
+        display: true,
+        details: { name: running.name, agent: running.agent, unreadableQuestion: true },
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+    return;
+  }
+
+  delete running.pendingAskSince;
+  delete running.invalidAskReported;
+
+  // Guard against re-notifying the same payload if the delete below fails.
+  const payloadKey = typeof payload.askId === "string" ? `ask:${payload.askId}` : `raw:${raw}`;
+  if (running.deliveredAskKey === payloadKey) {
+    removeAskFile(askFile);
+    return;
+  }
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
-  const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
+  const elapsed = Math.floor((now - running.startTime) / 1000);
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
+
+  removeAskFile(askFile);
+  running.deliveredAskKey = payloadKey;
 
   joins.question(running.id, name, payload.question);
   latestPi?.sendMessage(
@@ -2224,6 +2419,30 @@ async function watchSubagent(
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
+    if (result.reason === "surface_lost") {
+      // The pane or terminal disappeared. That is a local condition (the user
+      // closed it, or the mux stopped answering), not a provider failure, so
+      // this result deliberately sets no errorMessage: the provider-retry path
+      // must not reopen a pane the user just closed.
+      let lastOutput: string | null = null;
+      try {
+        if (existsSync(sessionFile)) {
+          lastOutput = findLastAssistantMessage(getNewEntries(sessionFile, 0));
+        }
+      } catch {
+        // A corrupt transcript must not hide the surface-lost report.
+      }
+      return {
+        name,
+        task,
+        summary: lastOutput ?? "No result was reported before the surface disappeared.",
+        sessionFile,
+        exitCode: 1,
+        elapsed,
+        surfaceLost: result.surfaceLostReason ?? "its pane or terminal no longer exists",
+      };
+    }
+
     if (running.cli === "claude") {
       // Claude Code result extraction
       let summary = "";
@@ -2235,9 +2454,13 @@ async function watchSubagent(
       }
 
       if (!summary) {
-        summary = readScreen(surface, 200)
-          .replace(/__SUBAGENT_DONE_\d+__/, "")
-          .trimEnd();
+        try {
+          summary = stripExitSentinel(readScreen(surface, 200)).trimEnd();
+        } catch {
+          // The pane can disappear between pollForExit and this read. Leave the
+          // summary empty and let the fallback below report the exit code.
+          summary = "";
+        }
       }
 
       if (!summary) {
@@ -2328,14 +2551,14 @@ async function watchSubagent(
 // the run itself instead: resume the same session (context preserved) with a
 // nudge message, up to PI_SUBAGENT_RETRY_MAX extra attempts. Only provider/agent
 // errors (`result.errorMessage`) are retried; a clean non-zero exit is not.
-function subagentSlug(name: string): string {
+function subagentSlug(name: string, fallback = "resume"): string {
   return (
     name
       .toLowerCase()
       .replace(/[^a-z0-9\s-]/g, "")
       .replace(/\s+/g, "-")
       .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "resume"
+      .replace(/^-|-$/g, "") || fallback
   );
 }
 
@@ -2415,7 +2638,7 @@ function buildResumeCommand(params: {
   // Resume in the subagent's original cwd so its tools operate where they did.
   const cdPrefix = params.loadout.cwd ? `cd ${shellEscape(params.loadout.cwd)} && ` : "";
 
-  const command = `${cdPrefix}${envPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = withExitSentinel(`${cdPrefix}${envPrefix}${parts.join(" ")}`);
   const launchScriptFile = join(
     params.artifactDir,
     "subagent-scripts",
@@ -2475,23 +2698,23 @@ async function retrySubagentRun(opts: RetryRunOptions): Promise<RetryRunOutcome>
   // Only the new attempt's output belongs in the result summary.
   const entryCountBefore = countSessionEntryLines(opts.sessionPath);
 
-  const surface = createSurface(opts.name);
-  await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-
+  const { surface, owned } = await openLaunchSurface(opts.name, undefined);
   try {
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Subagent retry script for ${opts.name} (attempt ${opts.attempt + 1}/${opts.maxAttempts})`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Session: ${opts.sessionPath}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
+    sendLaunchCommand(
+      surface,
+      command,
+      {
+        scriptPath: launchScriptFile,
+        scriptPreamble: [
+          `# Subagent retry script for ${opts.name} (attempt ${opts.attempt + 1}/${opts.maxAttempts})`,
+          `# Generated: ${new Date().toISOString()}`,
+          `# Session: ${opts.sessionPath}`,
+          `# Surface: ${surface}`,
+        ].join("\n"),
+      },
+      owned,
+    );
   } catch (error: any) {
-    try {
-      closeSurface(surface);
-    } catch {}
     return { error: error?.message ?? String(error) };
   }
 
@@ -2554,6 +2777,10 @@ function summarizeAttempt(
   entryCountBefore: number,
   result: SubagentResult,
 ): string {
+  // A lost surface already carries a clear, non-retryable report from
+  // watchSubagent; recomputing it from the transcript would replace it with a
+  // generic exit-code line.
+  if (result.surfaceLost) return result.summary;
   if (running.cli === "claude") return result.summary || fallbackExitSummary(result);
   try {
     return (
@@ -3351,23 +3578,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           scriptLabel: "resume",
         });
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        const { surface, owned } = await openLaunchSurface(name, undefined);
         try {
-          sendLongCommand(surface, command, {
-            scriptPath: launchScriptFile,
-            scriptPreamble: [
-              `# Subagent resume script for ${name}`,
-              `# Generated: ${new Date().toISOString()}`,
-              `# Session: ${sessionPath}`,
-              `# Surface: ${surface}`,
-              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-            ].join("\n"),
-          });
+          sendLaunchCommand(
+            surface,
+            command,
+            {
+              scriptPath: launchScriptFile,
+              scriptPreamble: [
+                `# Subagent resume script for ${name}`,
+                `# Generated: ${new Date().toISOString()}`,
+                `# Session: ${sessionPath}`,
+                `# Surface: ${surface}`,
+                ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+              ].join("\n"),
+            },
+            owned,
+          );
         } catch (error: any) {
-          try {
-            closeSurface(surface);
-          } catch {}
           const err = `Failed to start the resumed session: ${error?.message ?? String(error)}`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
