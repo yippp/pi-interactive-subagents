@@ -166,6 +166,28 @@ describe("getProviderAuthExtensionPath with a corrupt auth.json", () => {
     assert.equal(api.getProviderAuthExtensionPath("openai/gpt-4o"), undefined);
   });
 
+  it("never forwards parser messages that quote invalid credential text", () => {
+    const secret = "TOKEN_NEAR_ERROR";
+    writeFileSync(join(dir, "auth.json"), secret);
+    assert.throws(
+      () => api.getProviderAuthExtensionPath("anthropic/test-model"),
+      (error: Error) => {
+        assert.match(error.message, /not valid JSON/);
+        assert.doesNotMatch(error.message, /TOKEN_NEAR_ERROR|Unexpected token/);
+        assert.equal(error.cause, undefined);
+        return true;
+      },
+    );
+  });
+
+  it("refuses an existing unreadable credential path instead of assuming no OAuth", () => {
+    mkdirSync(join(dir, "auth.json"));
+    assert.throws(
+      () => api.getProviderAuthExtensionPath("anthropic/test-model"),
+      /Cannot read the stored Anthropic credentials/,
+    );
+  });
+
   it("does not silently skip the auth transport for a corrupt file on a null model path", () => {
     writeFileSync(join(dir, "auth.json"), "{");
     assert.throws(
@@ -728,4 +750,3 @@ describe("ask_question .ask handoff", () => {
     assert.equal(messages.length, 0, "no question text, so nothing to notify");
   });
 });
-

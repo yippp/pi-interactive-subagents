@@ -315,7 +315,7 @@ export async function readDesktopScreenAsync(terminal: string, lines: number): P
     const { stdout } = await execFileAsync(
       hcBin(),
       ["read", terminal, "--lines", String(Math.max(1, lines))],
-      { encoding: "utf8" },
+      { encoding: "utf8", timeout: 10_000 },
     );
     return lastLines(stdout, lines);
   } catch (error: any) {
@@ -334,7 +334,7 @@ export async function desktopExitState(
 ): Promise<{ finished: false } | { finished: true; exitCode: number }> {
   let stdout: string;
   try {
-    ({ stdout } = await execFileAsync(hcBin(), ["get", terminal, "--json"], { encoding: "utf8" }));
+    ({ stdout } = await execFileAsync(hcBin(), ["get", terminal, "--json"], { encoding: "utf8", timeout: 10_000 }));
   } catch (error: any) {
     const message = `hc get failed: ${errorMessage(error)}`;
     if (isHcNotFound(error)) throw new SurfaceGoneError(message);

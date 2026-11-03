@@ -644,6 +644,7 @@ export function readScreen(surface: string, lines = 50): string {
     return execFileSync(herdrBin(), readArgs(surface, lines), {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
     });
   } catch (error: any) {
     throw surfaceError("herdr pane read failed", error);
@@ -659,6 +660,7 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   try {
     const { stdout } = await execFileAsync(herdrBin(), readArgs(surface, lines), {
       encoding: "utf8",
+      timeout: 10_000,
     });
     return stdout;
   } catch (error: any) {

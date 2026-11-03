@@ -408,24 +408,28 @@ function getProviderAuthExtensionPath(
   let credentials: string;
   try {
     credentials = readFileSync(authFile, "utf8");
-  } catch {
-    return undefined; // no stored credentials: API key or env-var auth
+  } catch (error: any) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+      return undefined; // no stored credentials: API key or env-var auth
+    }
+    throw new Error(
+      `Cannot read the stored Anthropic credentials at ${authFile}. ` +
+        "Check the file and its permissions, then retry.",
+    );
   }
 
   // An existing-but-corrupt auth.json must fail loudly. Falling back to
-  // `undefined` here would drop the OAuth transport extension and let the
-  // child die on its first request with `400 You're out of extra usage`.
-  // The message names the file and the parse position only — never the file
-  // contents, which hold the subscription token.
+  // `undefined` here would silently omit the OAuth transport extension.
+  // JSON parser errors can quote secret-bearing input, so never include them
+  // in a tool result or attach them as the cause of a public error.
   let access: unknown;
   try {
     access = JSON.parse(credentials)?.anthropic?.access;
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
+  } catch {
     throw new Error(
-      `Cannot read the stored Anthropic credentials at ${authFile}: the file is not valid JSON ` +
-        `(${detail}). Fix or remove it (for example by signing in again), then retry. ` +
-        `Refusing to launch a Claude subagent without the auth transport extension.`,
+      `Cannot read the stored Anthropic credentials at ${authFile}: the file is not valid JSON. ` +
+        "Fix it (for example by signing in again), then retry. " +
+        "Refusing to launch without verifying the auth transport configuration.",
     );
   }
   if (typeof access !== "string" || !access.startsWith("sk-ant-oat")) return undefined;
