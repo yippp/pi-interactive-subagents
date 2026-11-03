@@ -162,7 +162,7 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 252 tests, 252 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 253 tests, 253 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
   works if `PI_SUBAGENT_ALLOWED` is unset. `test/system-prompt-mode.test.ts`
