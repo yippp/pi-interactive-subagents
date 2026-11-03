@@ -84,6 +84,12 @@ export function resolveChildPiBin(execPath: string, override?: string): string {
   return "pi";
 }
 
+export function childHerdrStatusExtension(execPath: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const child = basename(env.PI_SUBAGENT_PI_BIN || execPath).toLowerCase();
+  return env.HERDR_ENV === "1" && !!env.HERDR_PANE_ID &&
+    /^pi-bolt(-[a-z0-9]+)*(?:\.exe)?$/.test(child) ? "builtin:herdr" : undefined;
+}
+
 let cachedChildPiBin: string | undefined;
 
 /** Cached child CLI invocation (shell-escaped when it is an absolute path). */
@@ -1518,6 +1524,10 @@ function applySandboxToParts(
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
+    // Pi-Bolt's Herdr reporter registers no tools. Keep this one transport
+    // integration while global tool/provider discovery stays disabled.
+    const statusExtension = childHerdrStatusExtension(process.execPath);
+    if (statusExtension) parts.push("-e", shellEscape(statusExtension));
 
     const extPaths = new Set<string>();
     for (const tool of loadout.toolAllowlist.split(",")) {

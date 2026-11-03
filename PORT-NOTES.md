@@ -99,6 +99,14 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   cwd are passed as separate argv/`--cwd` values, so spaces are preserved
   without shell quoting. Desktop availability now checks `hcBin()`, so
   `PI_SUBAGENT_HC_BIN` is respected.
+- Windows TUI launch — query the new pane's foreground shell before typing
+  the launch command. Git Bash receives a quoted POSIX script path;
+  PowerShell and cmd receive a quoted `.cmd` wrapper in their own syntax.
+  An unknown shell is a launch error. Messages require a detected Herdr agent;
+  they are never sent as shell commands when agent detection fails.
+- Pi-Bolt Herdr status — restricted Pi-Bolt children in Herdr TUI explicitly
+  load `builtin:herdr` after `--no-extensions`. This reporter registers no
+  tools; the tool allowlist and provider restrictions remain in force.
 - CRLF agent files — `parseAgentDefinition` normalizes CRLF before parsing.
   Git checkouts on Windows (`core.autocrlf=true`) previously produced zero
   discoverable agents and silently empty agent defaults.
@@ -139,7 +147,7 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 234 tests, 234 pass. `test/run-tests.mjs` clears inherited
+- `npm test` — 241 tests, 241 pass. `test/run-tests.mjs` clears inherited
   `PI_SUBAGENT_*` variables so the suite is deterministic when run inside a
   subagent; direct `node --test test/test.ts` inside a restricted child also
   works if `PI_SUBAGENT_ALLOWED` is unset.
@@ -166,6 +174,11 @@ not reintroduce the tmux/WezTerm mux layer from the local package.
   the child cwd's default grouping for cross-project cwd, Windows drive-colon
   encoding, seeding a fork in the lab directory with the child cwd in its
   header, and resolving a relative artifact dir against the parent cwd.
+- Windows Git Bash TUI regression probe — a real Pi-Bolt parent and child
+  completed a model task in an isolated Herdr 0.9.5 server configured with
+  Git Bash as its default shell. The server identified the running child as
+  `pi-bolt`; completion delivery and an in-flight wait passed. The probe had
+  22 passing assertions and left the user's server and sessions unchanged.
 - Windows hc launch tests cover an absolute Git Bash plus a script and cwd
   containing spaces, `resolveBashFor` precedence (configured shell, Program
   Files Git, msys64, never a bare PATH bash), rejection of a non-absolute

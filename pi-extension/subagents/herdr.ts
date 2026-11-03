@@ -536,18 +536,23 @@ export function sendCommand(surface: string, command: string): void {
  * Deliver a message to the agent running in a pane. Goes through the agent
  * surface so Herdr honours bracketed paste and rejects an agent parked at an
  * approval or question dialog (`agent_blocked`) instead of typing over it.
- * Falls back to the raw pane only when Herdr has not recognised an agent in
- * the pane yet (`agent_not_found`), e.g. during startup.
+ * If Herdr cannot find an agent, fail rather than type the message into a
+ * shell that may interpret it as a command.
  */
 export function sendMessage(surface: string, message: string): void {
   requireMux();
   if (isHerdrDesktopAvailable()) return sendDesktopMessage(surface, message);
-  try {
-    herdrJson(["agent", "prompt", surface, message]);
-  } catch (error: any) {
-    if (!/agent_not_found/.test(error?.message ?? "")) throw error;
-    sendCommand(surface, message);
-  }
+  herdrJson(["agent", "prompt", surface, message]);
+}
+
+/** Build a launch command for the shell actually running in a Windows pane. */
+export function windowsPaneLaunchCommand(shellName: string, scriptPath: string, posixScriptPath: string): string {
+  const name = shellName.toLowerCase().replace(/\.exe$/, "");
+  if (["bash", "sh", "zsh"].includes(name)) return `bash ${shellEscape(posixScriptPath)}`;
+  const shim = scriptPath.replace(/\.sh$/i, ".cmd");
+  if (["pwsh", "powershell"].includes(name)) return `& '${shim.replace(/'/g, "''")}'`;
+  if (name === "cmd") return `"${shim.replace(/"/g, '""')}"`;
+  throw new Error(`Cannot launch subagent: unsupported Herdr pane shell "${shellName || "unknown"}".`);
 }
 
 /**
@@ -590,20 +595,23 @@ export function sendLongCommand(
     return scriptPath;
   }
 
-  // Windows panes run PowerShell or cmd, which disagree about quoting an
-  // executable path with spaces. A .cmd shim next to the script is typed as a
-  // bare, space-free path and resolves the same way in both shells.
   if (process.platform === "win32") {
     const posixDir = bashPosixDir(dirname(scriptPath));
-    if (posixDir) {
+    if (!posixDir) throw new Error("Cannot resolve the subagent script path in Git Bash.");
+    const info = herdrJson(["pane", "process-info", "--pane", surface])?.process_info;
+    const shell = info?.foreground_processes?.find((p: any) => p.pid === info.shell_pid)
+      ?? info?.foreground_processes?.[0];
+    const shellName = typeof shell?.name === "string" ? shell.name : "";
+    const launch = windowsPaneLaunchCommand(shellName, scriptPath, `${posixDir}/${basename(scriptPath)}`);
+    if (/^(?:pwsh|powershell|cmd)(?:\.exe)?$/i.test(shellName)) {
       const shimPath = scriptPath.replace(/\.sh$/i, ".cmd");
       writeFileSync(
         shimPath,
         `@echo off\r\n"${resolveBash()}" "${posixDir}/${basename(scriptPath)}"\r\n`,
       );
-      sendCommand(surface, shimPath);
-      return scriptPath;
     }
+    sendCommand(surface, launch);
+    return scriptPath;
   }
 
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
