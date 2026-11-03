@@ -225,7 +225,11 @@ To grant one MCP tool to a child, wrap it in a dedicated extension that
 registers only that tool and call `registerToolExtension(name, path)`; there is
 no per-server isolation for MCP.
 
-## Switch blockers (unverified, do not replace the active package until checked)
+## Switch blockers and remaining gaps
+
+The first three items record what has been exercised against a live Pi-Bolt/Herdr
+setup; the rest are still unverified. Read them before replacing the active
+package.
 
 1. Windows herdr-core 0.1.17 was tested headlessly with the desktop backend:
    a 65-check probe covered child launch, message delivery, exit status,
