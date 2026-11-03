@@ -25,11 +25,13 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import {
+  herdrApiErrorCode,
   isMuxAvailable,
   muxSetupHint,
   needsShellReadyDelay,
   createSurface,
   sendMessage,
+  sendPaneText,
   sendLongCommand,
   withExitSentinel,
   stripExitSentinel,
@@ -37,6 +39,8 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
+  probePanePiProcess,
+  type PanePiProbeFailure,
 } from "./herdr.ts";
 
 import {
@@ -1634,15 +1638,39 @@ function resolveRunningByName(name: string):
 }
 
 /**
+ * Rejection codes that mean "Herdr refused to type this because it does not
+ * recognise an agent here", before any input reached the child. `agent_blocked`
+ * (a dialog owns the input) and `timeout` / `agent_prompt_failed` (unknown write
+ * state) are deliberately excluded: falling back for those would type over a
+ * prompt or duplicate a delivery.
+ */
+const AGENT_UNRECOGNISED_CODES = new Set(["agent_not_ready", "agent_not_found"]);
+
+/**
  * Type a follow-up message into a running subagent's live pane. Newlines are
  * collapsed to spaces because each newline submits a turn in the child's TUI
  * editor; a multi-line message would otherwise fire as several partial turns.
+ *
+ * Delivery prefers Herdr's agent surface (`herdr agent prompt`), which honours
+ * bracketed paste and refuses a blocked dialog. Herdr only accepts that call
+ * when it recognises the pane's agent. A Pi-Bolt child reports a custom Herdr
+ * agent label (`pi-bolt`) that Herdr 0.9.5 does not know, so a healthy child can
+ * be rejected with `agent_not_ready` even though its TUI is waiting for input.
+ *
+ * In exactly that case - a rejection before any input was written - the
+ * message is typed into the pane instead, which is how this extension delivered
+ * follow-ups before the agent surface existed. The fallback requires positive
+ * proof that this run's Pi process is alive in this pane and runs this run's
+ * session file (`probePanePiProcess`); anything unproven stays an error rather
+ * than risking the text being executed as a shell command.
  */
 function steerSubagent(
   running: RunningSubagent,
   message: string,
   send: (surface: string, command: string) => void = sendMessage,
-): { ok: true } | { error: string } {
+  deliverToPane: (surface: string, message: string) => void = sendPaneText,
+  probe: typeof probePanePiProcess = probePanePiProcess,
+): { ok: true; delivery?: "agent" | "pane" } | { error: string } {
   if (running.retrying) {
     return {
       error:
@@ -1651,23 +1679,76 @@ function steerSubagent(
     };
   }
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
+  let firstError: any;
   try {
     send(running.surface, flattened);
     // A reply answers a pending ask_question: release a join that stopped on it.
     joins.answer(running.name);
-    return { ok: true };
+    return { ok: true, delivery: "agent" };
+  } catch (error: any) {
+    firstError = error;
+  }
+
+  if (running.cli === "claude" || !AGENT_UNRECOGNISED_CODES.has(herdrApiErrorCode(firstError) ?? "")) {
+    return { error: steerFailureMessage(running, firstError) };
+  }
+
+  const probeResult = probe(running.surface, { sessionFile: running.sessionFile });
+  if (!probeResult.ok) {
+    return { error: steerFallbackRefusal(running, firstError, probeResult) };
+  }
+
+  try {
+    deliverToPane(running.surface, flattened);
+    joins.answer(running.name);
+    return { ok: true, delivery: "pane" };
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via Herdr: ` +
-        `${error?.message ?? String(error)}`,
+        `Failed to deliver message to subagent "${running.name}": Herdr did not accept it as an agent ` +
+        `(${herdrApiErrorCode(firstError) ?? "agent_prompt_failed"}) and typing it into pane ` +
+        `${running.surface} also failed: ${error?.message ?? String(error)}`,
     };
   }
+}
+
+function steerFailureMessage(running: RunningSubagent, error: any): string {
+  return (
+    `Failed to deliver message to subagent "${running.name}" via Herdr: ` +
+    `${error?.message ?? String(error)}`
+  );
+}
+
+/** Explain a refused fallback without exposing command lines or task text. */
+function steerFallbackRefusal(
+  running: RunningSubagent,
+  error: any,
+  probeResult: { ok: false; reason: PanePiProbeFailure; detail: string },
+): string {
+  const code = herdrApiErrorCode(error) ?? "agent_prompt_failed";
+  const why = probeResult.reason === "pane_gone"
+    ? "its pane is gone, so the run has ended"
+    : probeResult.reason === "session_mismatch"
+      ? "the Pi process in that pane is not running this subagent's session (it restarted or belongs to another run)"
+      : probeResult.reason === "shell_only"
+        ? "that pane currently holds only a shell, not a running Pi process"
+        : probeResult.reason === "no_child"
+          ? "no Pi process could be found inside that pane's shell tree"
+          : probeResult.reason === "ambiguous"
+            ? "several Pi processes in that pane claim the same session"
+            : probeResult.detail;
+  return (
+    `Herdr refused the message for subagent "${running.name}" (${code}) and typing it into pane ` +
+    `${running.surface} was refused as well: ${why}. ` +
+    `The message was not delivered; check the pane or spawn a fresh subagent.`
+  );
 }
 
 function handleSubagentSteer(
   params: { name?: string; message?: string },
   send: (surface: string, command: string) => void = sendMessage,
+  deliverToPane: (surface: string, message: string) => void = sendPaneText,
+  probe: typeof probePanePiProcess = probePanePiProcess,
 ) {
   const message = params.message?.trim();
   if (!message) {
@@ -1687,7 +1768,7 @@ function handleSubagentSteer(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  const steer = steerSubagent(running, message, send);
+  const steer = steerSubagent(running, message, send, deliverToPane, probe);
   if ("error" in steer) {
     return {
       content: [{ type: "text" as const, text: steer.error }],
@@ -1705,7 +1786,12 @@ function handleSubagentSteer(
         `Message delivered to running subagent "${running.name}". It picks this up at its next ` +
         `turn boundary. If it exits, its result still arrives as a steer message.`,
     }],
-    details: { id: running.id, name: running.name, status: "steered" },
+    details: {
+      id: running.id,
+      name: running.name,
+      status: "steered",
+      ...(steer.delivery === "pane" ? { delivery: "pane" } : {}),
+    },
   };
 }
 

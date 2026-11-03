@@ -30,7 +30,7 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/herdr.ts";
+import { shellEscape, HerdrApiError } from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -2497,7 +2497,7 @@ describe("subagent interruption", () => {
       sentText = text;
     });
 
-    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(result, { ok: true, delivery: "agent" });
     assert.equal(sentSurface, "pane-1");
     assert.equal(sentText, "do this then that");
   });
@@ -2511,6 +2511,136 @@ describe("subagent interruption", () => {
     });
 
     assert.match(result.error, /Failed to deliver message/);
+  });
+
+  // ── Agent-unrecognised fallback ──
+  // Herdr 0.9.5 does not know the `pi-bolt` agent label, so `agent prompt`
+  // rejects a healthy child with agent_not_ready before writing anything. Only
+  // that rejection, and only with positive proof of the run's own Pi process,
+  // may fall back to typing into the pane.
+  function notReady() {
+    return new HerdrApiError("agent_not_ready", "agent w1:p1 is not an active named agent");
+  }
+
+  const PROOF_OK = { ok: true as const, proof: { pid: 4242, name: "pi-bolt.exe" } };
+  const SESSION = "C:/test/sessions/worker.jsonl";
+
+  function runSteer(
+    error: Error,
+    probeResult: unknown,
+    overrides: Record<string, unknown> = {},
+  ) {
+    const testApi = (subagentsModule as any).__test__;
+    const calls: Array<{ kind: string; surface: string; text: string }> = [];
+    const result = testApi.steerSubagent(
+      makeRunning({ sessionFile: SESSION, ...overrides }),
+      "keep going\non this",
+      () => {
+        // The agent surface refuses before writing, which is what triggers the
+        // fallback decision.
+        throw error;
+      },
+      (surface: string, text: string) => calls.push({ kind: "pane", surface, text }),
+      () => probeResult,
+    );
+    return { result, calls };
+  }
+
+  it("falls back to typing into the pane after agent_not_ready, with proof", () => {
+    const { result, calls } = runSteer(notReady(), PROOF_OK);
+    assert.deepEqual(result, { ok: true, delivery: "pane" });
+    assert.deepEqual(calls, [{ kind: "pane", surface: "pane-1", text: "keep going on this" }]);
+  });
+
+  it("does not use the Pi fallback for Claude processes", () => {
+    const { result, calls } = runSteer(notReady(), PROOF_OK, { cli: "claude" });
+    assert.match(result.error, /Failed to deliver message/);
+    assert.equal(calls.length, 0);
+  });
+
+  it("falls back after agent_not_found as well", () => {
+    const { result, calls } = runSteer(
+      new HerdrApiError("agent_not_found", "agent target w1:p1 not found"),
+      PROOF_OK,
+    );
+    assert.deepEqual(result, { ok: true, delivery: "pane" });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].kind, "pane");
+  });
+
+  for (const code of ["agent_blocked", "timeout", "agent_prompt_failed", "agent_prompt_stalled"]) {
+    it(`never falls back after ${code}`, () => {
+      const { result, calls } = runSteer(new HerdrApiError(code, "refused"), PROOF_OK);
+      assert.match(result.error, /Failed to deliver message/);
+      assert.equal(calls.length, 0, "nothing may be typed into the pane");
+    });
+  }
+
+  it("does not fall back for a non-Herdr transport failure", () => {
+    const { result, calls } = runSteer(new Error("herdr agent prompt failed: socket closed"), PROOF_OK);
+    assert.match(result.error, /Failed to deliver message/);
+    assert.equal(calls.length, 0);
+  });
+
+  for (const reason of ["shell_only", "pane_gone", "no_child", "session_mismatch", "ambiguous", "probe_unavailable"]) {
+    it(`refuses the fallback when the probe reports ${reason}`, () => {
+      const { result, calls } = runSteer(notReady(), { ok: false, reason, detail: "probe detail" });
+      assert.match(result.error, /agent_not_ready/);
+      assert.match(result.error, /The message was not delivered/);
+      assert.equal(calls.length, 0, "an unproven pane must not receive the text");
+    });
+  }
+
+  it("explains each refusal reason in plain words", () => {
+    const cases: Array<[string, RegExp]> = [
+      ["shell_only", /only a shell/],
+      ["pane_gone", /pane is gone/],
+      ["no_child", /no Pi process/],
+      ["session_mismatch", /not running this subagent's session/],
+      ["ambiguous", /several Pi processes/],
+    ];
+    for (const [reason, expected] of cases) {
+      const { result } = runSteer(notReady(), { ok: false, reason, detail: "d" });
+      assert.match(result.error, expected, `expected ${reason} to be explained`);
+    }
+  });
+
+  it("reports a failed pane write after a successful probe", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const result = testApi.steerSubagent(
+      makeRunning({ sessionFile: SESSION }),
+      "go",
+      () => {
+        throw notReady();
+      },
+      () => {
+        throw new Error("pane run failed");
+      },
+      () => PROOF_OK,
+    );
+    assert.match(result.error, /agent_not_ready/);
+    assert.match(result.error, /pane run failed/);
+  });
+
+  it("passes the delivery kind through the tool result", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    try {
+      runningMap.set("a1", makeRunning({ sessionFile: SESSION }));
+      const result = testApi.handleSubagentSteer(
+        { name: "Worker", message: "go" },
+        () => {
+          throw notReady();
+        },
+        () => {},
+        () => PROOF_OK,
+      );
+      assert.equal(result.details.status, "steered");
+      assert.equal(result.details.delivery, "pane");
+    } finally {
+      runningMap.clear();
+    }
   });
 
   it("delivers a steer message and forces local status waiting", () => {

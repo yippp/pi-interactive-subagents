@@ -139,7 +139,8 @@ function herdrJson(args: string[]): any {
   try {
     stdout = execFileSync(herdrBin(), args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   } catch (error: any) {
-    throw new Error(`herdr ${args[0]} ${args[1] ?? ""} failed: ${herdrErrorMessage(error)}`);
+    if (error instanceof HerdrApiError) throw error;
+    throw herdrCliError(args, error);
   }
   return parseHerdrResponse(stdout);
 }
@@ -149,9 +150,27 @@ async function herdrJsonAsync(args: string[]): Promise<any> {
   try {
     ({ stdout } = await execFileAsync(herdrBin(), args, { encoding: "utf8" }));
   } catch (error: any) {
-    throw new Error(`herdr ${args[0]} ${args[1] ?? ""} failed: ${herdrErrorMessage(error)}`);
+    if (error instanceof HerdrApiError) throw error;
+    throw herdrCliError(args, error);
   }
   return parseHerdrResponse(stdout);
+}
+
+/** Keep the server's error code when the CLI exits non-zero and prints it on stderr. */
+function herdrCliError(args: string[], error: any): Error {
+  const stderr = typeof error?.stderr === "string" ? error.stderr.trim() : "";
+  if (stderr) {
+    try {
+      const parsed = JSON.parse(stderr);
+      if (parsed?.error?.code) {
+        return new HerdrApiError(
+          parsed.error.code,
+          parsed.error.message ?? "Herdr request failed",
+        );
+      }
+    } catch {}
+  }
+  return new Error(`herdr ${args[0]} ${args[1] ?? ""} failed: ${herdrErrorMessage(error)}`);
 }
 
 function parseHerdrResponse(stdout: string): any {
@@ -159,9 +178,33 @@ function parseHerdrResponse(stdout: string): any {
   if (!trimmed) return null;
   const parsed = JSON.parse(trimmed);
   if (parsed?.error) {
-    throw new Error(`${parsed.error.code}: ${parsed.error.message}`);
+    throw new HerdrApiError(parsed.error.code, parsed.error.message);
   }
   return parsed?.result ?? parsed;
+}
+
+/**
+ * A Herdr server error with its machine-readable code (`agent_not_ready`,
+ * `agent_blocked`, `pane_not_found`, …). Callers that must distinguish a
+ * specific rejection from a generic transport failure read `code` instead of
+ * matching message text.
+ */
+export class HerdrApiError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(`${code}: ${message}`);
+    this.name = "HerdrApiError";
+    this.code = code;
+  }
+}
+
+/** The Herdr error code carried by an error, or null for non-Herdr failures. */
+export function herdrApiErrorCode(error: unknown): string | null {
+  if (error instanceof HerdrApiError) return error.code;
+  const code = (error as any)?.code;
+  // Only Herdr server errors count: Node errors use codes like `ENOENT`.
+  return (error as any)?.name === "HerdrApiError" && typeof code === "string" ? code : null;
 }
 
 function herdrErrorMessage(error: any): string {
@@ -547,6 +590,265 @@ export function sendMessage(surface: string, message: string): void {
   herdrJson(["agent", "prompt", surface, message]);
 }
 
+/**
+ * Type a message into the pane's terminal and submit it with Enter.
+ *
+ * This is the pre-agent-surface delivery path: the text is written to the
+ * pane's input and followed by Enter, exactly like a user typing into the child
+ * TUI. `pane run` writes text and submits in one ordered operation, so it
+ * honours live bracketed paste and keeps the message as a single submission.
+ *
+ * Only used after a positive identity check: this bypasses Herdr's agent
+ * detection, so it would otherwise type into a bare shell.
+ */
+export function sendPaneText(surface: string, message: string): void {
+  requireMux();
+  if (isHerdrDesktopAvailable()) return sendDesktopCommand(surface, message);
+  herdrJson(["pane", "run", surface, message]);
+}
+
+// ── Pane child identity probe ──
+
+/**
+ * Why a pane's live Pi child could not be proven. Every value means "refuse":
+ * typing into an unverified pane could execute the text as a shell command.
+ */
+export type PanePiProbeFailure =
+  | "pane_gone"
+  | "no_child"
+  | "shell_only"
+  | "session_mismatch"
+  | "ambiguous"
+  | "probe_unavailable";
+
+/**
+ * Proof that a specific Pi process is running in the target pane.
+ * Deliberately narrow: a pid, its executable name, and the fact that its own
+ * command line names the expected session. Never the command line itself and
+ * never the task text, so nothing sensitive reaches a message or a log.
+ */
+export interface PanePiProof {
+  pid: number;
+  name: string;
+}
+
+export type PanePiProbe =
+  | { ok: true; proof: PanePiProof }
+  | { ok: false; reason: PanePiProbeFailure; detail: string };
+
+/** `pi`, `pi.exe`, `pi-bolt.exe`, `pi-bolt-win32-x64-jit.exe`. */
+const PI_PROCESS_NAME = /^pi(?:-bolt(?:-[a-z0-9]+)*)?(?:\.exe)?$/i;
+
+/** How long a process-table query may take before the probe refuses. */
+const PROBE_TIMEOUT_MS = 5_000;
+
+interface PaneProcess {
+  pid: number;
+  name: string;
+  cmdline?: string;
+}
+
+/**
+ * Compare a command line against the session file the run owns.
+ * Windows paths are case-insensitive and may arrive with either separator, so
+ * both sides are normalized before an exact full-path comparison. A substring
+ * match is not enough: `--session a.jsonl` must not match `a.jsonl.bak`.
+ */
+function cmdlineNamesSession(cmdline: string, sessionFile: string, platform: NodeJS.Platform): boolean {
+  const normalize = (value: string) => {
+    let out = value.trim().replace(/^["']|["']$/g, "").replace(/[\\/]+/g, "/");
+    if (platform === "win32") out = out.toLowerCase();
+    return out;
+  };
+  const target = normalize(sessionFile);
+  if (!target) return false;
+  // Tokenize on whitespace, keeping quoted paths together, then compare each
+  // token with quotes stripped.
+  const tokens = cmdline.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  for (let i = 0; i < tokens.length - 1; i++) {
+    if (tokens[i] === "--session" && normalize(tokens[i + 1]) === target) return true;
+  }
+  return false;
+}
+
+/**
+ * Live processes below `rootPid`, as reported by the OS.
+ *
+ * Herdr's `pane process-info` lists only the pane's foreground job, which on
+ * Windows is the shell; the real Pi child is a grandchild of it. A bounded
+ * process-table walk is the only way to see that child, so it is used only
+ * when a check is actually needed.
+ */
+function windowsDescendants(rootPid: number): PaneProcess[] {
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$root = ${Number(rootPid)}`,
+    "$procs = Get-CimInstance -ClassName Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CommandLine",
+    "$children = @{}",
+    "foreach ($p in $procs) { $k = [int]$p.ParentProcessId; if (-not $children.ContainsKey($k)) { $children[$k] = @() }; $children[$k] += $p }",
+    // A function-scoped `$out +=` would edit a copy; keep the collector in
+    // script scope so the walk actually appends.
+    "$script:out = [System.Collections.ArrayList]@()",
+    "$script:seen = [System.Collections.Generic.HashSet[int]]::new()",
+    "function Walk([int]$id) { if (-not $script:seen.Add($id)) { return }; foreach ($c in $children[$id]) { if ($null -eq $c) { continue }; [void]$script:out.Add([pscustomobject]@{ pid = [int]$c.ProcessId; name = [string]$c.Name; cmdline = [string]$c.CommandLine }); Walk ([int]$c.ProcessId) } }",
+    "Walk $root",
+    "ConvertTo-Json -InputObject $script:out.ToArray() -Compress",
+  ].join("; ");
+
+  const stdout = execFileSync(
+    powerShellCommand(),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: PROBE_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
+  );
+
+  const parsed = JSON.parse(stdout.trim() || "[]");
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  return rows
+    .filter((row: any) => row && Number.isInteger(row.pid))
+    .map((row: any) => ({
+      pid: Number(row.pid),
+      name: typeof row.name === "string" ? row.name : "",
+      cmdline: typeof row.cmdline === "string" ? row.cmdline : undefined,
+    }));
+}
+
+/**
+ * PowerShell 7 for the process-table query. If unavailable, the identity
+ * check fails and the caller refuses the terminal fallback.
+ */
+function powerShellCommand(): string {
+  return "pwsh";
+}
+
+/** The pane's shell pid, plus the processes Herdr already sees as foreground. */
+function paneProcessInfo(surface: string): { shellPid: number | null; foreground: PaneProcess[] } {
+  const info = herdrJson(["pane", "process-info", "--pane", surface])?.process_info;
+  const shellPid = Number.isInteger(info?.shell_pid) ? Number(info.shell_pid) : null;
+  const foreground = (Array.isArray(info?.foreground_processes) ? info.foreground_processes : [])
+    .filter((row: any) => row && Number.isInteger(row.pid))
+    .map((row: any) => ({
+      pid: Number(row.pid),
+      name: typeof row.name === "string" ? row.name : "",
+      cmdline: typeof row.cmdline === "string" ? row.cmdline : undefined,
+    }));
+  return { shellPid, foreground };
+}
+
+/**
+ * Injection seam for the probe: production reads Herdr and the OS process
+ * table; tests supply fixed process tables so no real pane is touched.
+ */
+export interface PanePiProbeDeps {
+  paneProcessInfo(surface: string): { shellPid: number | null; foreground: PaneProcess[] };
+  descendants(rootPid: number): PaneProcess[];
+}
+
+const defaultPanePiProbeDeps: PanePiProbeDeps = {
+  paneProcessInfo,
+  descendants: windowsDescendants,
+};
+
+/**
+ * Prove that the Pi process this run launched is still alive in its pane.
+ *
+ * The check is positive, not inferred: the pane must exist, the OS must show a
+ * Pi-named process inside the pane's shell process tree, and that process's own
+ * command line must name the exact session file the run owns. Anything less
+ * (a bare shell, a stale activity file, a foreign or restarted session) is
+ * refused with a reason the caller can report.
+ *
+ * There is an unavoidable gap between this check and the write that follows;
+ * see PORT-NOTES.md. The probe narrows the window, it does not close it.
+ */
+export function probePanePiProcess(
+  surface: string,
+  expected: { sessionFile: string },
+  platform: NodeJS.Platform = process.platform,
+  deps: PanePiProbeDeps = defaultPanePiProbeDeps,
+): PanePiProbe {
+  if (!expected.sessionFile?.trim()) {
+    return { ok: false, reason: "session_mismatch", detail: "this run has no session file to match" };
+  }
+
+  let info: { shellPid: number | null; foreground: PaneProcess[] };
+  try {
+    info = deps.paneProcessInfo(surface);
+  } catch (error: any) {
+    const code = herdrApiErrorCode(error);
+    if (code === "pane_not_found" || code === "terminal_not_found") {
+      return { ok: false, reason: "pane_gone", detail: `pane ${surface} no longer exists` };
+    }
+    return {
+      ok: false,
+      reason: "probe_unavailable",
+      detail: `could not read the pane's processes: ${error?.message ?? String(error)}`,
+    };
+  }
+
+  let candidates: PaneProcess[];
+  if (platform === "win32") {
+    if (info.shellPid === null) {
+      return { ok: false, reason: "probe_unavailable", detail: "Herdr did not report the pane's shell process" };
+    }
+    let descendants: PaneProcess[];
+    try {
+      descendants = deps.descendants(info.shellPid);
+    } catch (error: any) {
+      return {
+        ok: false,
+        reason: "probe_unavailable",
+        detail: `could not query the process tree: ${error?.message ?? String(error)}`,
+      };
+    }
+    // The shell itself is not a candidate: a shell must never receive this text.
+    // `conhost` is part of the pane's plumbing, not a child of interest.
+    const interesting = descendants.filter(
+      (proc) => proc.pid !== info.shellPid && !/^(?:conhost|conpty|OpenConsole)(?:\.exe)?$/i.test(proc.name),
+    );
+    candidates = interesting.filter((proc) => PI_PROCESS_NAME.test(proc.name));
+    if (candidates.length === 0) {
+      return {
+        ok: false,
+        reason: interesting.length === 0 ? "shell_only" : "no_child",
+        detail: "no Pi process runs inside this pane's shell tree",
+      };
+    }
+  } else {
+    // Unix panes report the foreground job directly, so no extra query is
+    // needed; only an already-identified Pi counts.
+    candidates = info.foreground.filter(
+      (proc) => proc.pid !== info.shellPid && PI_PROCESS_NAME.test(proc.name),
+    );
+    if (candidates.length === 0) {
+      return {
+        ok: false,
+        reason: info.foreground.length === 0 ? "shell_only" : "no_child",
+        detail: "Herdr reports no Pi process in this pane",
+      };
+    }
+  }
+
+  const matched = candidates.filter(
+    (proc) => proc.cmdline && cmdlineNamesSession(proc.cmdline, expected.sessionFile, platform),
+  );
+  if (matched.length === 0) {
+    return {
+      ok: false,
+      reason: "session_mismatch",
+      detail: `a Pi process runs in this pane, but none runs the session this subagent owns`,
+    };
+  }
+  if (matched.length > 1) {
+    return {
+      ok: false,
+      reason: "ambiguous",
+      detail: `${matched.length} Pi processes in this pane claim the same session`,
+    };
+  }
+
+  return { ok: true, proof: { pid: matched[0].pid, name: matched[0].name } };
+}
+
 /** Build a launch command for the shell actually running in a Windows pane. */
 export function windowsPaneLaunchCommand(shellName: string, scriptPath: string, posixScriptPath: string): string {
   const name = shellName.toLowerCase().replace(/\.exe$/, "");
@@ -765,8 +1067,9 @@ export const __pollForExitTest__ = {
   parseSentinelExitCode,
   isSurfaceGoneError,
 };
+/** Probe internals, exposed for tests: the real descendant walk and the session match. */
+export const __probeTest__ = { windowsDescendants, cmdlineNamesSession };
 export const __layoutTest__ = { planEvenSplits, chooseSplitDirection, chooseSurfaceKind };
-
 /** Exit code from the terminal sentinel a launch script echoes, or null. */
 export function parseSentinelExitCode(screen: string): number | null {
   const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
